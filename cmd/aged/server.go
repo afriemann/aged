@@ -18,9 +18,23 @@ import (
 	"filippo.io/age"
 )
 
-// nameRe restricts secret names to filesystem-safe characters, preventing
-// path traversal attacks.
-var nameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+// nameRe validates each segment of a secret name (segments are split on /).
+// Slashes are allowed as namespace separators; the full name is validated by validName.
+var nameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)*$`)
+
+// validName returns true if name passes the regex and contains no .. segments.
+// This is the single authoritative gate called by all HTTP handlers.
+func validName(name string) bool {
+	if !nameRe.MatchString(name) {
+		return false
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if seg == ".." || seg == "." {
+			return false
+		}
+	}
+	return true
+}
 
 // Store holds an age identity and manages the encrypted secret files on disk.
 type Store struct {
@@ -56,8 +70,23 @@ func newStore(identityFile, secretsDir string) (*Store, error) {
 
 func (s *Store) publicKey() string { return s.identity.Recipient().String() }
 
+// secretPath returns the absolute path for a secret file, verifying it lies
+// within the secrets directory to prevent path traversal.
+func (s *Store) secretPath(name string) (string, error) {
+	path := filepath.Join(s.secretsDir, filepath.FromSlash(name)+".age")
+	rel, err := filepath.Rel(s.secretsDir, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("invalid secret name: path escapes secrets directory")
+	}
+	return path, nil
+}
+
 func (s *Store) getValue(name string) (string, error) {
-	f, err := os.Open(filepath.Join(s.secretsDir, name+".age"))
+	path, err := s.secretPath(name)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
@@ -76,10 +105,14 @@ func (s *Store) getValue(name string) (string, error) {
 }
 
 func (s *Store) setValue(name, value string) error {
-	f, err := os.OpenFile(
-		filepath.Join(s.secretsDir, name+".age"),
-		os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600,
-	)
+	path, err := s.secretPath(name)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create namespace dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("create secret file: %w", err)
 	}
@@ -96,25 +129,41 @@ func (s *Store) setValue(name, value string) error {
 }
 
 func (s *Store) removeValue(name string) error {
-	err := os.Remove(filepath.Join(s.secretsDir, name+".age"))
-	if errors.Is(err, fs.ErrNotExist) {
-		return fs.ErrNotExist
+	path, err := s.secretPath(name)
+	if err != nil {
+		return err
 	}
-	return err
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fs.ErrNotExist
+		}
+		return err
+	}
+	// Clean up empty parent namespace directories (but not secretsDir itself).
+	for dir := filepath.Dir(path); dir != s.secretsDir; dir = filepath.Dir(dir) {
+		entries, _ := os.ReadDir(dir)
+		if len(entries) != 0 {
+			break
+		}
+		os.Remove(dir)
+	}
+	return nil
 }
 
 func (s *Store) listNames() ([]string, error) {
-	entries, err := os.ReadDir(s.secretsDir)
-	if err != nil {
-		return nil, err
-	}
 	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".age") {
-			names = append(names, strings.TrimSuffix(e.Name(), ".age"))
+	err := filepath.WalkDir(s.secretsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".age") {
+			return err
 		}
-	}
-	return names, nil
+		rel, err := filepath.Rel(s.secretsDir, path)
+		if err != nil {
+			return err
+		}
+		names = append(names, filepath.ToSlash(strings.TrimSuffix(rel, ".age")))
+		return nil
+	})
+	return names, err
 }
 
 // serve starts the HTTP server using configuration from loadConfig.
@@ -153,9 +202,9 @@ func serve() error {
 		}
 	}))
 
-	mux.HandleFunc("GET /secrets/{name}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		if !nameRe.MatchString(name) {
+		if !validName(name) {
 			http.Error(w, "invalid secret name", http.StatusBadRequest)
 			return
 		}
@@ -172,9 +221,9 @@ func serve() error {
 		fmt.Fprint(w, value)
 	}))
 
-	mux.HandleFunc("POST /secrets/{name}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		if !nameRe.MatchString(name) {
+		if !validName(name) {
 			http.Error(w, "invalid secret name", http.StatusBadRequest)
 			return
 		}
@@ -192,9 +241,9 @@ func serve() error {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 
-	mux.HandleFunc("DELETE /secrets/{name}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		if !nameRe.MatchString(name) {
+		if !validName(name) {
 			http.Error(w, "invalid secret name", http.StatusBadRequest)
 			return
 		}
@@ -255,13 +304,4 @@ func bearerMiddleware(token string) func(http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 		}
 	}
-}
-
-// envPath returns the env var value, or a path under $HOME as a fallback.
-func envPath(env, rel string) string {
-	if v := os.Getenv(env); v != "" {
-		return v
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, rel)
 }

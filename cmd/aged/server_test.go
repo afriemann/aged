@@ -37,7 +37,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(names)
 	}))
-	mux.HandleFunc("GET /secrets/{name}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		if !nameRe.MatchString(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
@@ -50,7 +50,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 		}
 		fmt.Fprint(w, val)
 	}))
-	mux.HandleFunc("POST /secrets/{name}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		if !nameRe.MatchString(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
@@ -60,7 +60,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 		store.setValue(name, strings.TrimRight(string(body), "\n"))
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	mux.HandleFunc("DELETE /secrets/{name}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		if !nameRe.MatchString(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
