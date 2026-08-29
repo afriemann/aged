@@ -1,0 +1,13 @@
+[Unit]
+Description=aged secret server
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/aged/env
+ExecStart=/usr/local/bin/aged serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
