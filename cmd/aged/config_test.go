@@ -1,6 +1,7 @@
 package main
 
 // spec: openspec/changes/config-file/specs/aged/spec.md
+// spec: openspec/changes/client-config/specs/aged/spec.md
 
 import (
 	"os"
@@ -85,5 +86,33 @@ func TestLoadConfig_DefaultsAppliedWhenNothingSet(t *testing.T) {
 	}
 	if cfg.SecretsDir == "" {
 		t.Error("default SecretsDir should not be empty")
+	}
+}
+
+func TestLoadConfig_ConfigFileProvidesServerURL(t *testing.T) {
+	// spec: Client Server URL Config — Config file provides server URL
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfgFile, []byte(`server_url = "https://aged.example.com"`+"\n"), 0o600)
+	t.Setenv("AGED_CONFIG", cfgFile)
+	t.Setenv("AGED_SERVER_URL", "")
+
+	cfg := loadConfig()
+	if cfg.ServerURL != "https://aged.example.com" {
+		t.Errorf("got ServerURL %q, want %q", cfg.ServerURL, "https://aged.example.com")
+	}
+}
+
+func TestLoadConfig_EnvVarOverridesConfigFileServerURL(t *testing.T) {
+	// spec: Client Server URL Config — Env var overrides config file server URL
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfgFile, []byte(`server_url = "https://aged.example.com"`+"\n"), 0o600)
+	t.Setenv("AGED_CONFIG", cfgFile)
+	t.Setenv("AGED_SERVER_URL", "http://localhost:8743")
+
+	cfg := loadConfig()
+	if cfg.ServerURL != "http://localhost:8743" {
+		t.Errorf("got ServerURL %q, want %q", cfg.ServerURL, "http://localhost:8743")
 	}
 }

@@ -74,12 +74,19 @@ addr        = "127.0.0.1:8743"
 
 ## Client usage
 
-Set these in your shell environment (or `~/.bashrc`):
+
+Create `~/.config/aged/config.toml` (mode 0600) — no environment variables needed:
+
+```toml
+token      = "your-bearer-token"
+server_url = "https://aged.automate.wtf"
+```
 
 ```sh
-export AGED_SERVER_URL=https://secrets.home.example.com
-export AGED_TOKEN=<your-token>
+chmod 600 ~/.config/aged/config.toml
 ```
+
+Environment variables (`AGED_TOKEN`, `AGED_SERVER_URL`) still override the config file when set.
 
 ```sh
 # Store a secret

@@ -10,14 +10,15 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Config holds all server runtime configuration. Fields are populated by
-// loadConfig: config file values are applied first, then env var values
-// override them.
+// Config holds all server and client runtime configuration. Fields are
+// populated by loadConfig: config file values are applied first, then env var
+// values override them.
 type Config struct {
 	Token      string `toml:"token"`
 	Identity   string `toml:"identity"`
 	SecretsDir string `toml:"secrets_dir"`
 	Addr       string `toml:"addr"`
+	ServerURL  string `toml:"server_url"`
 }
 
 // loadConfig returns the effective server configuration. It searches for a
@@ -53,6 +54,10 @@ func loadConfig() Config {
 		cfg.Addr = v
 	}
 
+	if v := os.Getenv("AGED_SERVER_URL"); v != "" {
+		cfg.ServerURL = v
+	}
+
 	// Apply defaults for any field still unset.
 	if cfg.Identity == "" {
 		cfg.Identity = defaultPath(".config/aged/identity.age")
@@ -62,6 +67,9 @@ func loadConfig() Config {
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = "127.0.0.1:8743"
+	}
+	if cfg.ServerURL == "" {
+		cfg.ServerURL = "http://localhost:8743"
 	}
 
 	return cfg

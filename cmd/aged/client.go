@@ -12,8 +12,8 @@ import (
 
 // serverURL returns the configured server base URL.
 func serverURL() string {
-	if v := os.Getenv("AGED_SERVER_URL"); v != "" {
-		return strings.TrimRight(v, "/")
+	if url := loadConfig().ServerURL; url != "" {
+		return strings.TrimRight(url, "/")
 	}
 	return "http://localhost:8743"
 }
@@ -21,16 +21,16 @@ func serverURL() string {
 // request performs an authenticated HTTP request and returns the trimmed body,
 // the status code, and any transport error.
 func request(method, path string, body io.Reader) (string, int, error) {
-	token := os.Getenv("AGED_TOKEN")
-	if token == "" {
-		return "", 0, errors.New("AGED_TOKEN environment variable is required")
+	cfg := loadConfig()
+	if cfg.Token == "" {
+		return "", 0, errors.New("AGED_TOKEN environment variable (or config file token) is required")
 	}
 
 	req, err := http.NewRequest(method, serverURL()+path, body)
 	if err != nil {
 		return "", 0, fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	if body != nil {
 		req.Header.Set("Content-Type", "text/plain")
 	}
