@@ -103,6 +103,9 @@ aged delete ha-token
 
 # Show server's public key
 aged pubkey
+
+# Rotate the bearer token (run on server, then restart + update client configs)
+aged rotate-token
 ```
 
 ## chezmoi integration

@@ -14,6 +14,8 @@ Commands:
   set <name>         store a secret value (reads from stdin)
   list               list all secret names
   delete <name>      delete a secret
+  rotate-token       generate a new token and update the config file in place
+
   pubkey             print the server's age public key
 
 Server environment variables:
@@ -61,6 +63,8 @@ func main() {
 		err = del(os.Args[2])
 	case "pubkey":
 		err = pubkey()
+	case "rotate-token":
+		err = rotateToken(os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], helpText)
 		os.Exit(1)
