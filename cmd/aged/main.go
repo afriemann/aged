@@ -29,6 +29,14 @@ Client environment variables:
   AGED_TOKEN         bearer token  (required)
 `
 
+// noArgs exits with an error if unexpected arguments follow a no-argument subcommand.
+func noArgs(cmd string) {
+	if len(os.Args) > 2 {
+		fmt.Fprintf(os.Stderr, "%s takes no arguments\nusage: aged %s\n", cmd, cmd)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, helpText)
@@ -38,8 +46,10 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "serve":
+		noArgs("serve")
 		err = serve()
 	case "init":
+		noArgs("init")
 		err = initIdentity()
 	case "get":
 		if len(os.Args) < 3 {
@@ -54,6 +64,7 @@ func main() {
 		}
 		err = set(os.Args[2])
 	case "list":
+		noArgs("list")
 		err = list()
 	case "delete":
 		if len(os.Args) < 3 {
@@ -62,8 +73,10 @@ func main() {
 		}
 		err = del(os.Args[2])
 	case "pubkey":
+		noArgs("pubkey")
 		err = pubkey()
 	case "rotate-token":
+		noArgs("rotate-token")
 		err = rotateToken(os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], helpText)
