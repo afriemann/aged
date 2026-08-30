@@ -128,3 +128,60 @@ Then in any chezmoi template:
 ```
 
 chezmoi calls `aged get ha-token` and uses the stdout as the secret value.
+
+## fail2ban integration
+
+aged logs one line to stderr (→ journald) for every authentication attempt:
+
+```
+auth failure: GET /secrets/ha-token from 198.51.100.42
+auth ok: GET /secrets/ha-token from 198.51.100.42
+```
+
+The log format is a stable contract — the `contrib/fail2ban/` configs depend on it.
+
+> **Note on success logging:** `auth ok:` lines record which secret was fetched and from which IP. Anyone with journal read access (`journalctl`) can see this access pattern. If secret *names* are sensitive in your environment, be aware of this trade-off; journal access is already a privileged operation.
+
+### 1. Configure Caddy to forward the real client IP
+
+Without this, aged sees every request coming from `127.0.0.1` (Caddy's loopback connection) and fail2ban cannot identify the attacker. Add `header_up` inside your `reverse_proxy` block:
+
+```
+secrets.home.example.com {
+    reverse_proxy 127.0.0.1:8743 {
+        header_up X-Real-IP {remote_host}
+    }
+}
+```
+
+Reload Caddy after making this change.
+
+### 2. Install the fail2ban filter and jail
+
+```sh
+sudo cp contrib/fail2ban/filter.d/aged-auth.conf /etc/fail2ban/filter.d/
+sudo cp contrib/fail2ban/jail.d/aged.conf        /etc/fail2ban/jail.d/
+sudo systemctl reload fail2ban
+```
+
+The jail uses `backend = systemd` — it reads directly from the journal, so no log file path is needed. Default settings: ban after 5 failures in 60 seconds for 10 minutes. Adjust `maxretry`, `findtime`, and `bantime` in `/etc/fail2ban/jail.d/aged.conf` to suit your environment.
+
+Test that the filter matches correctly before a real attack:
+
+```sh
+fail2ban-regex --usedns=no \
+  "auth failure: GET /secrets/ha-token from 198.51.100.42" \
+  /etc/fail2ban/filter.d/aged-auth.conf
+```
+
+### 3. (Optional) Tune journald rate-limiting
+
+Under a heavy brute-force attack journald may rate-limit aged's log output, causing fail2ban to under-count failures and delay banning. To raise the limit, add to `/etc/systemd/journald.conf`:
+
+```ini
+[Journal]
+RateLimitBurst=1000
+RateLimitIntervalSec=10s
+```
+
+Then restart journald: `sudo systemctl restart systemd-journald`.
