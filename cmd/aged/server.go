@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -179,7 +180,8 @@ func serve() error {
 	}
 
 	addr := cfg.Addr
-	auth := bearerMiddleware(cfg.Token)
+	log.SetFlags(0) // disable timestamp prefix; journald records its own timestamps
+	auth := bearerMiddleware(cfg.Token, os.Stderr)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /pubkey", auth(func(w http.ResponseWriter, _ *http.Request) {
@@ -291,16 +293,62 @@ func initIdentity() error {
 	return nil
 }
 
+// sanitiseLogField replaces CR, LF, and all other ASCII control characters
+// with '_' to prevent CRLF log-injection when attacker-controlled request
+// fields (method, URL path) are interpolated into log lines.
+func sanitiseLogField(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '_'
+		}
+		return r
+	}, s)
+}
+
+// resolveClientIP returns the real client IP for use in log lines.
+//
+// Trust model: proxy headers are honoured only when the immediate peer
+// (r.RemoteAddr) is a loopback address, which means the request arrived
+// through the local reverse proxy (Caddy). A direct, non-loopback peer is
+// untrusted and could forge headers, so its own IP is used directly.
+//
+// X-Forwarded-For is intentionally not consulted: it is a comma-delimited
+// list whose leftmost entry is attacker-controlled, adding spoofable surface
+// with no benefit over X-Real-IP set by Caddy via header_up X-Real-IP
+// {remote_host}.
+func resolveClientIP(r *http.Request) string {
+	peer, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// RemoteAddr has no port (unusual but safe to handle gracefully).
+		peer = r.RemoteAddr
+	}
+	if peer == "127.0.0.1" || peer == "::1" {
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return xri
+		}
+		return peer
+	}
+	return peer
+}
+
 // bearerMiddleware returns an HTTP middleware that enforces Bearer token auth
-// using constant-time comparison to prevent timing attacks.
-func bearerMiddleware(token string) func(http.HandlerFunc) http.HandlerFunc {
+// using constant-time comparison to prevent timing attacks. Every request
+// produces exactly one log line written to logDst recording the outcome
+// and resolved client IP; see resolveClientIP and sanitiseLogField.
+func bearerMiddleware(token string, logDst io.Writer) func(http.HandlerFunc) http.HandlerFunc {
+	logger := log.New(logDst, "", 0)
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			ip := resolveClientIP(r)
+			method := sanitiseLogField(r.Method)
+			path := sanitiseLogField(r.URL.Path)
 			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+				logger.Printf("auth failure: %s %s from %s", method, path, sanitiseLogField(ip))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
+			logger.Printf("auth ok: %s %s from %s", method, path, sanitiseLogField(ip))
 			next(w, r)
 		}
 	}

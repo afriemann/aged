@@ -3,6 +3,7 @@ package main
 // spec: openspec/specs/aged/spec.md
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,7 +24,7 @@ const testToken = "test-bearer-token"
 func testServer(t *testing.T) (*httptest.Server, *Store) {
 	t.Helper()
 	store := testStore(t)
-	auth := bearerMiddleware(testToken)
+	auth := bearerMiddleware(testToken, io.Discard)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /pubkey", auth(func(w http.ResponseWriter, _ *http.Request) {
@@ -325,6 +326,125 @@ func TestInitIdentity_RefusesToOverwriteExisting(t *testing.T) {
 	newStat, _ := os.Stat(path)
 	if !newStat.ModTime().Equal(originalStat.ModTime()) {
 		t.Error("existing identity file was modified")
+	}
+}
+
+// authMiddlewareWith returns a bearerMiddleware handler wired to the given
+// log writer. It registers a single GET /secrets route so tests have a
+// real endpoint to hit.
+func authMiddlewareWith(t *testing.T, logDst io.Writer, token, reqToken, remoteAddr, xRealIP, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	auth := bearerMiddleware(token, logDst)
+	handler := auth(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(method, path, nil)
+	req.RemoteAddr = remoteAddr
+	if xRealIP != "" {
+		req.Header.Set("X-Real-IP", xRealIP)
+	}
+	if reqToken != "" {
+		req.Header.Set("Authorization", "Bearer "+reqToken)
+	}
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+	return rr
+}
+
+func TestBearerMiddleware_AuthFailureLoggedWithRealClientIP(t *testing.T) {
+	// spec: HTTP Authentication — Auth failure logged with real client IP
+	var buf bytes.Buffer
+	authMiddlewareWith(t, &buf, testToken, "wrong", "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
+	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 1.2.3.4") {
+		t.Errorf("log %q: want auth failure line with real IP 1.2.3.4", buf.String())
+	}
+}
+
+func TestBearerMiddleware_AuthSuccessLoggedWithRealClientIP(t *testing.T) {
+	// spec: HTTP Authentication — Auth success logged with real client IP
+	var buf bytes.Buffer
+	authMiddlewareWith(t, &buf, testToken, testToken, "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
+	if !strings.Contains(buf.String(), "auth ok: GET /secrets from 1.2.3.4") {
+		t.Errorf("log %q: want auth ok line with real IP 1.2.3.4", buf.String())
+	}
+}
+
+func TestBearerMiddleware_AuthFailureLoggedWithLoopbackWhenXRealIPAbsent(t *testing.T) {
+	// spec: HTTP Authentication — Auth failure logged with loopback IP when X-Real-IP absent
+	var buf bytes.Buffer
+	authMiddlewareWith(t, &buf, testToken, "wrong", "127.0.0.1:12345", "" /* no X-Real-IP */, http.MethodGet, "/secrets")
+	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 127.0.0.1") {
+		t.Errorf("log %q: want auth failure line with loopback IP", buf.String())
+	}
+}
+
+func TestBearerMiddleware_AuthFailureLoggedWithDirectPeerIPWhenNotBehindProxy(t *testing.T) {
+	// spec: HTTP Authentication — Auth failure logged with direct peer IP when not behind proxy
+	var buf bytes.Buffer
+	// Non-loopback peer; X-Real-IP must be ignored.
+	authMiddlewareWith(t, &buf, testToken, "wrong", "10.0.0.5:54321", "1.2.3.4" /* must be ignored */, http.MethodGet, "/secrets")
+	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 10.0.0.5") {
+		t.Errorf("log %q: want auth failure line with peer IP 10.0.0.5 (not X-Real-IP)", buf.String())
+	}
+}
+
+func TestBearerMiddleware_AuthFailureLoggedWithIPv6RealClientIP(t *testing.T) {
+	// spec: HTTP Authentication — Auth failure logged with real client IP
+	// Exercises the ::1 loopback branch.
+	var buf bytes.Buffer
+	authMiddlewareWith(t, &buf, testToken, "wrong", "[::1]:12345", "2001:db8::1", http.MethodGet, "/secrets")
+	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 2001:db8::1") {
+		t.Errorf("log %q: want auth failure line with IPv6 real IP 2001:db8::1", buf.String())
+	}
+}
+
+func TestBearerMiddleware_CRLFInPathDoesNotForgeSecondLogLine(t *testing.T) {
+	// spec: HTTP Authentication — CRLF in path does not forge a second log line
+	for _, tc := range []struct {
+		name  string
+		token string // use testToken for success, "wrong" for failure
+		want  string
+	}{
+		{"failure path", "wrong", "auth failure:"},
+		{"success path", testToken, "auth ok:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			auth := bearerMiddleware(testToken, &buf)
+			handler := auth(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+			req := httptest.NewRequest(http.MethodGet, "/secrets/foo", nil)
+			req.RemoteAddr = "127.0.0.1:12345"
+			req.Header.Set("X-Real-IP", "1.2.3.4")
+			if tc.token != "" {
+				req.Header.Set("Authorization", "Bearer "+tc.token)
+			}
+			// Inject control characters into the path that the middleware will log.
+			req.URL.Path = "/secrets/foo\r\nauth failure: GET /secrets from 9.9.9.9"
+			rr := httptest.NewRecorder()
+			handler(rr, req)
+
+			logged := buf.String()
+			// Trim the logger's own trailing newline before splitting/checking.
+			trimmed := strings.TrimRight(logged, "\n")
+
+			// Must be exactly one log line (no injected second line).
+			lines := strings.Split(trimmed, "\n")
+			if len(lines) != 1 {
+				t.Errorf("expected 1 log line, got %d: %q", len(lines), logged)
+			}
+			// No raw CR or internal LF may remain.
+			if strings.ContainsAny(trimmed, "\r\n") {
+				t.Errorf("log %q: raw CR/LF must be sanitised", logged)
+			}
+			// The control characters must have been replaced with underscores.
+			if !strings.Contains(trimmed, "__") {
+				t.Errorf("log %q: expected __ in sanitised path", logged)
+			}
+			// Confirm the right outcome prefix.
+			if !strings.Contains(trimmed, tc.want) {
+				t.Errorf("log %q: expected prefix %q", logged, tc.want)
+			}
+		})
 	}
 }
 
