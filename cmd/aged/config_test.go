@@ -2,10 +2,14 @@ package main
 
 // spec: openspec/changes/config-file/specs/aged/spec.md
 // spec: openspec/changes/client-config/specs/aged/spec.md
+// spec: openspec/changes/security-hardening/specs/aged/spec.md
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -114,5 +118,32 @@ func TestLoadConfig_EnvVarOverridesConfigFileServerURL(t *testing.T) {
 	cfg := loadConfig()
 	if cfg.ServerURL != "http://localhost:8743" {
 		t.Errorf("got ServerURL %q, want %q", cfg.ServerURL, "http://localhost:8743")
+	}
+}
+
+func TestLoadConfig_MalformedConfigFileLogsWarning(t *testing.T) {
+	// spec: Config File Loading — Malformed config file logs a warning and continues
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfgFile, []byte("token = [invalid toml\n"), 0o600); err != nil {
+		t.Fatalf("write malformed config: %v", err)
+	}
+	t.Setenv("AGED_CONFIG", cfgFile)
+	t.Setenv("AGED_TOKEN", "from-env") // ensure server can start despite bad file
+
+	// loadConfig uses log.Printf (global logger); redirect it to capture the warning.
+	// No t.Parallel() is used in this package so global state mutation is safe here.
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	loadConfig()
+
+	logged := buf.String()
+	if !strings.Contains(logged, "warning") {
+		t.Errorf("log output %q: expected a warning about the malformed config", logged)
+	}
+	if !strings.Contains(logged, cfgFile) {
+		t.Errorf("log output %q: expected the config file path in the warning", logged)
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 // spec: openspec/changes/rotate-token/specs/aged/spec.md
+// spec: openspec/changes/security-hardening/specs/aged/spec.md
 
 import (
 	"bytes"
@@ -107,5 +108,69 @@ func TestRotateToken_TwoRotationsProduceDifferentTokens(t *testing.T) {
 
 	if first["token"] == second["token"] {
 		t.Error("two consecutive rotations produced the same token")
+	}
+}
+
+func TestRotateToken_AtomicWrite_OriginalIntactOnError(t *testing.T) {
+	// spec: Token Rotation — Failed write leaves original config intact
+	if os.Getuid() == 0 {
+		t.Skip("cannot test filesystem permissions as root")
+	}
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, map[string]any{"token": "original-token"})
+	t.Setenv("AGED_CONFIG", path)
+
+	originalContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read original: %v", err)
+	}
+
+	// Make the directory unwritable so os.CreateTemp fails.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	// Always restore before TempDir cleanup runs.
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	if err := rotateToken(&bytes.Buffer{}); err == nil {
+		t.Fatal("expected error when directory is not writable, got nil")
+	}
+
+	// Restore permissions to read the file.
+	os.Chmod(dir, 0o755)
+
+	// Original must be unchanged.
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after failed rotate: %v", err)
+	}
+	if !bytes.Equal(content, originalContent) {
+		t.Errorf("config file was modified: got %q, want %q", content, originalContent)
+	}
+
+	// No stray temp files must remain.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".config-") {
+			t.Errorf("stray temp file not cleaned up: %s", e.Name())
+		}
+	}
+}
+
+func TestRotateToken_NoTempFilesAfterSuccess(t *testing.T) {
+	// spec: Token Rotation — Failed write leaves original config intact (success path cleanup)
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, map[string]any{"token": "start"})
+	t.Setenv("AGED_CONFIG", path)
+
+	if err := rotateToken(&bytes.Buffer{}); err != nil {
+		t.Fatalf("rotateToken: %v", err)
+	}
+
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".config-") {
+			t.Errorf("stray temp file not cleaned up after success: %s", e.Name())
+		}
 	}
 }

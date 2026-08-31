@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/BurntSushi/toml"
 )
@@ -34,14 +35,29 @@ func rotateToken(w io.Writer) error {
 	newToken := hex.EncodeToString(b)
 	raw["token"] = newToken
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+	// Atomic write: stage to a temp file in the same directory (guarantees
+	// same filesystem so os.Rename is atomic), then rename over the original.
+	// defer os.Remove ensures no stray .config-*.toml files survive on error.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.toml")
 	if err != nil {
-		return fmt.Errorf("write config: %w", err)
+		return fmt.Errorf("stage config: %w", err)
 	}
-	defer f.Close()
+	defer tmp.Close()           // fd cleanup on all error paths; double-close after explicit Close is harmless
+	defer os.Remove(tmp.Name()) // no-op after successful Rename; cleans up on any failure
 
-	if err := toml.NewEncoder(f).Encode(raw); err != nil {
+	// os.CreateTemp already creates with 0600, but use the fd-based Chmod to
+	// make the intent explicit and avoid the path-based TOCTOU window.
+	if err := tmp.Chmod(0o600); err != nil {
+		return fmt.Errorf("set temp file permissions: %w", err)
+	}
+	if err := toml.NewEncoder(tmp).Encode(raw); err != nil {
 		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
 	}
 
 	fmt.Fprintf(w, "token rotated in %s\n", path)

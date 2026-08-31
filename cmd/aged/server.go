@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"filippo.io/age"
 )
@@ -167,6 +168,19 @@ func (s *Store) listNames() ([]string, error) {
 	return names, err
 }
 
+// newHTTPServer constructs an http.Server with hardened per-connection
+// timeouts. Extracted for testability; serve() calls it directly.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+}
+
 // serve starts the HTTP server using configuration from loadConfig.
 func serve() error {
 	cfg := loadConfig()
@@ -262,7 +276,7 @@ func serve() error {
 	}))
 
 	log.Printf("aged listening on %s", addr)
-	return http.ListenAndServe(addr, mux)
+	return newHTTPServer(addr, mux).ListenAndServe()
 }
 
 // initIdentity generates a new X25519 age identity and writes it to disk.
@@ -322,7 +336,14 @@ func resolveClientIP(r *http.Request) string {
 		// RemoteAddr has no port (unusual but safe to handle gracefully).
 		peer = r.RemoteAddr
 	}
-	if peer == "127.0.0.1" || peer == "::1" {
+	// Trust X-Real-IP only when the direct TCP peer is a loopback address —
+	// meaning the request arrived through the local reverse proxy (Caddy).
+	// net.IP.IsLoopback() handles 127.0.0.1, ::1, ::ffff:127.0.0.1, and the
+	// full 127.0.0.0/8 range. A direct non-loopback peer is untrusted and
+	// could forge headers, so its own IP is used directly.
+	// X-Forwarded-For is intentionally not consulted.
+	ip := net.ParseIP(peer)
+	if ip != nil && ip.IsLoopback() {
 		if xri := r.Header.Get("X-Real-IP"); xri != "" {
 			return xri
 		}
@@ -344,6 +365,7 @@ func bearerMiddleware(token string, logDst io.Writer) func(http.HandlerFunc) htt
 			method := sanitiseLogField(r.Method)
 			path := sanitiseLogField(r.URL.Path)
 			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="aged"`)
 				logger.Printf("auth failure: %s %s from %s", method, path, sanitiseLogField(ip))
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
