@@ -1,6 +1,7 @@
 package main
 
 // spec: openspec/specs/aged/spec.md
+// spec: openspec/changes/security-hardening/specs/aged/spec.md
 
 import (
 	"bytes"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 )
@@ -40,7 +42,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 	}))
 	mux.HandleFunc("GET /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		if !nameRe.MatchString(name) {
+		if !validName(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
 			return
 		}
@@ -53,7 +55,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 	}))
 	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		if !nameRe.MatchString(name) {
+		if !validName(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
 			return
 		}
@@ -63,7 +65,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 	}))
 	mux.HandleFunc("DELETE /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
-		if !nameRe.MatchString(name) {
+		if !validName(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
 			return
 		}
@@ -476,5 +478,67 @@ func TestMain_NoArgsCommandsRejectExtraArgs(t *testing.T) {
 				t.Errorf("command %q: expected noArgs to trigger for extra arg", cmd)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Security-hardening tests (M-01 covered in rotate_test.go,
+// M-02 covered in config_test.go)
+// ---------------------------------------------------------------------------
+
+func TestResolveClientIP_IPv4MappedLoopback(t *testing.T) {
+	// spec: HTTP Authentication — Auth failure logged with IPv4-mapped loopback peer
+	req := httptest.NewRequest(http.MethodGet, "/secrets", nil)
+	req.RemoteAddr = "[::ffff:127.0.0.1]:12345"
+	req.Header.Set("X-Real-IP", "1.2.3.4")
+
+	got := resolveClientIP(req)
+	if got != "1.2.3.4" {
+		t.Errorf("resolveClientIP with ::ffff:127.0.0.1 peer = %q, want 1.2.3.4", got)
+	}
+}
+
+func TestBearerMiddleware_WWWAuthenticateHeaderOnFailure(t *testing.T) {
+	// spec: HTTP Authentication — WWW-Authenticate header present on 401
+	var buf bytes.Buffer
+	auth := bearerMiddleware(testToken, &buf)
+	handler := auth(func(w http.ResponseWriter, _ *http.Request) {})
+	req := httptest.NewRequest(http.MethodGet, "/secrets", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Authorization", "Bearer wrong-token")
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rr.Code)
+	}
+	got := rr.Header().Get("WWW-Authenticate")
+	const wantWWWAuth = `Bearer realm="aged"`
+	if got != wantWWWAuth {
+		t.Errorf("WWW-Authenticate = %q, want %q", got, wantWWWAuth)
+	}
+}
+
+func TestNewHTTPServer_HasNonZeroTimeouts(t *testing.T) {
+	// spec: HTTP Server Configuration — Server is configured with non-zero timeouts
+	srv := newHTTPServer("127.0.0.1:0", http.NewServeMux())
+
+	const (
+		minReadHeader = 5 * time.Second
+		minRead       = 10 * time.Second
+		minWrite      = 30 * time.Second
+		minIdle       = 60 * time.Second
+	)
+	if srv.ReadHeaderTimeout < minReadHeader {
+		t.Errorf("ReadHeaderTimeout = %v, want >= %v", srv.ReadHeaderTimeout, minReadHeader)
+	}
+	if srv.ReadTimeout < minRead {
+		t.Errorf("ReadTimeout = %v, want >= %v", srv.ReadTimeout, minRead)
+	}
+	if srv.WriteTimeout < minWrite {
+		t.Errorf("WriteTimeout = %v, want >= %v", srv.WriteTimeout, minWrite)
+	}
+	if srv.IdleTimeout < minIdle {
+		t.Errorf("IdleTimeout = %v, want >= %v", srv.IdleTimeout, minIdle)
 	}
 }

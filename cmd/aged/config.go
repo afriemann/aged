@@ -4,6 +4,7 @@ package main
 // spec: openspec/changes/config-file/specs/aged/spec.md
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 
@@ -34,10 +35,9 @@ func loadConfig() Config {
 	cfg := Config{}
 
 	if path := configFilePath(); path != "" {
-		// Ignore decode errors for missing files; toml.DecodeFile returns an
-		// error when the file does not exist, which is already handled by
-		// configFilePath only returning paths that exist.
-		toml.DecodeFile(path, &cfg) //nolint:errcheck // non-fatal; env vars can supply missing values
+		if _, err := toml.DecodeFile(path, &cfg); err != nil {
+			log.Printf("warning: failed to parse config file %s: %v", path, err)
+		}
 	}
 
 	// Env var overrides.
