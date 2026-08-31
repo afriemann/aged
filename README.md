@@ -12,37 +12,69 @@ make install PREFIX=~/.local
 
 ## Server setup (on homebox)
 
-**1. Generate an identity key:**
+The service unit uses `StateDirectory=aged` — systemd creates and owns `/var/lib/aged` automatically on first start. Do **not** use home-directory paths for identity or secrets; the hardened unit sets `ProtectHome=yes` which makes `/home`, `/root`, and `/run/user` inaccessible to the process.
 
-```sh
-aged init
-# public key:  age1xxxx...
-# identity:    ~/.config/aged/identity.age
-```
-
-**2. Create `/etc/aged/env`** (mode 0600):
-
-```sh
-AGED_TOKEN=<generate with: openssl rand -hex 32>
-AGED_IDENTITY=/home/<user>/.config/aged/identity.age
-AGED_SECRETS_DIR=/home/<user>/.config/aged/secrets/
-AGED_ADDR=127.0.0.1:8743
-```
-
-**3. Install and start the systemd service:**
+**1. Install the unit and let systemd create the directories:**
 
 ```sh
 sudo cp aged.service /etc/systemd/system/aged.service
 sudo systemctl daemon-reload
+sudo systemctl start aged   # creates /var/lib/aged and /etc/aged; will fail (no token yet — expected)
+sudo systemctl stop aged
+```
+
+**2. Generate an identity key into `/var/lib/aged`:**
+
+```sh
+sudo -u aged AGED_IDENTITY=/var/lib/aged/identity.age aged init
+# public key:  age1xxxx...
+# identity:    /var/lib/aged/identity.age
+```
+
+**3. Create `/etc/aged/config.toml`** (mode 0600):
+
+```sh
+sudo tee /etc/aged/config.toml <<'EOF'
+token       = "<generate with: openssl rand -hex 32>"
+identity    = "/var/lib/aged/identity.age"
+secrets_dir = "/var/lib/aged/secrets"
+addr        = "127.0.0.1:8743"
+EOF
+sudo chmod 600 /etc/aged/config.toml
+sudo chown aged:aged /etc/aged/config.toml
+```
+
+**4. Start and enable the service:**
+
+```sh
 sudo systemctl enable --now aged
 ```
 
-**4. Put it behind your reverse proxy** (Caddy example):
+**5. Verify confinement (optional but recommended):**
+
+```sh
+systemd-analyze security aged.service
+```
+
+**6. Put it behind your reverse proxy** (Caddy example):
 
 ```
 secrets.home.example.com {
-    reverse_proxy 127.0.0.1:8743
+    reverse_proxy 127.0.0.1:8743 {
+        header_up X-Real-IP {remote_host}
+    }
 }
+```
+
+**Migrating from a home-directory deployment:** If you previously stored identity/secrets under `~/.config/aged/`, move them and fix ownership before restarting under the hardened unit:
+
+```sh
+sudo systemctl stop aged
+sudo mv /home/<user>/.config/aged/identity.age /var/lib/aged/
+sudo mv /home/<user>/.config/aged/secrets       /var/lib/aged/
+sudo chown -R aged:aged /var/lib/aged            # critical — moved files keep old owner
+# update /etc/aged/config.toml to point at /var/lib/aged paths
+sudo systemctl start aged
 ```
 
 ## Configuration
