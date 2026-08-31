@@ -1,3 +1,4 @@
+# spec: openspec/changes/service-hardening/specs/service-hardening/spec.md
 [Unit]
 Description=aged secret server
 After=network.target
@@ -5,9 +6,50 @@ After=network.target
 [Service]
 Type=simple
 User=aged
+Group=aged
 ExecStart=/usr/local/bin/aged serve
 Restart=on-failure
 RestartSec=5
+
+# Directories — systemd creates these with correct ownership on first start.
+# StateDirectory adds /var/lib/aged to the read-write set automatically.
+# ConfigurationDirectory creates /etc/aged. No ReadWritePaths is needed for
+# /etc/aged: aged serve only reads config.toml at startup, never writes it.
+# (rotate-token runs as an operator CLI command outside this sandbox; it
+# relies on DAC permissions on the 0600 aged:aged config file, not on a
+# sandbox write-hole.)
+StateDirectory=aged
+ConfigurationDirectory=aged
+
+# Process isolation
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+# Filesystem hardening — read-only everywhere except the StateDirectory write
+# hole above. ProtectHome=yes makes /home, /root and /run/user inaccessible;
+# use /var/lib/aged paths in /etc/aged/config.toml.
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+# Capability and syscall reduction
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Additional hardening
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Network — AF_INET/AF_INET6 for the loopback listener.
+# AF_UNIX is required for NSS/NSCD: CGO-enabled Go builds use glibc's
+# getaddrinfo, which may contact the name-service cache daemon at
+# /var/run/nscd/socket. Omitting it risks broken DNS under the sandbox.
+# All other families (AF_NETLINK, AF_PACKET, etc.) are denied.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target
