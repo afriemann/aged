@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 )
 
@@ -63,14 +62,32 @@ func get(name string) error {
 	}
 }
 
-// set reads a secret value from stdin and stores it on the server.
-func set(name string) error {
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
+// resolveSetValue determines the secret value for the set command. If
+// hasArg is true, argValue is used directly. Otherwise the value is read
+// from stdin. It is an error to supply both an explicit argument and piped
+// stdin data, and an error for the resolved value to be empty.
+func resolveSetValue(argValue string, hasArg bool, hasPipedStdin bool, stdin io.Reader) (string, error) {
+	if hasArg && hasPipedStdin {
+		return "", errors.New("value supplied as both an argument and via piped stdin; use only one")
 	}
-	value := strings.TrimRight(string(data), "\n")
 
+	value := argValue
+	if !hasArg {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("read stdin: %w", err)
+		}
+		value = strings.TrimRight(string(data), "\n")
+	}
+
+	if value == "" {
+		return "", errors.New("value must not be empty")
+	}
+	return value, nil
+}
+
+// set stores a secret value on the server.
+func set(name, value string) error {
 	_, status, err := request("POST", "/secrets/"+name, strings.NewReader(value))
 	if err != nil {
 		return err

@@ -11,7 +11,7 @@ Commands:
   serve              start the HTTP server
   init               generate a new age identity key
   get <name>         fetch a secret value (stdout only — suitable for chezmoi)
-  set <name>         store a secret value (reads from stdin)
+  set <name> [value] store a secret value (from argument, or stdin if omitted)
   list               list all secret names
   delete <name>      delete a secret
   rotate-token       generate a new token and update the config file in place
@@ -37,6 +37,16 @@ func noArgs(cmd string) {
 	}
 }
 
+// stdinIsPiped reports whether stdin is connected to a pipe or redirected
+// file, as opposed to an interactive terminal.
+func stdinIsPiped() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice == 0
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, helpText)
@@ -58,11 +68,21 @@ func main() {
 		}
 		err = get(os.Args[2])
 	case "set":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: aged set <name>")
+		if len(os.Args) < 3 || len(os.Args) > 4 {
+			fmt.Fprintln(os.Stderr, "usage: aged set <name> [value]")
 			os.Exit(1)
 		}
-		err = set(os.Args[2])
+		hasArg := len(os.Args) == 4
+		var argValue string
+		if hasArg {
+			argValue = os.Args[3]
+		}
+		value, resolveErr := resolveSetValue(argValue, hasArg, stdinIsPiped(), os.Stdin)
+		if resolveErr != nil {
+			fmt.Fprintln(os.Stderr, "error:", resolveErr)
+			os.Exit(1)
+		}
+		err = set(os.Args[2], value)
 	case "list":
 		noArgs("list")
 		err = list()

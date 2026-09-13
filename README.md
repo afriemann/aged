@@ -121,8 +121,11 @@ chmod 600 ~/.config/aged/config.toml
 Environment variables (`AGED_TOKEN`, `AGED_SERVER_URL`) still override the config file when set.
 
 ```sh
-# Store a secret
+# Store a secret via stdin
 echo -n "my-token-value" | aged set ha-token
+
+# Store a secret via an explicit argument
+aged set ha-token "my-token-value"
 
 # Retrieve it
 aged get ha-token
