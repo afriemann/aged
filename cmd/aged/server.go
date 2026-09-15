@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -16,8 +15,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"filippo.io/age"
 )
 
 // nameRe validates each segment of a secret name (segments are split on /).
@@ -25,7 +22,8 @@ import (
 var nameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)*$`)
 
 // validName returns true if name passes the regex and contains no .. segments.
-// This is the single authoritative gate called by all HTTP handlers.
+// This is the single authoritative gate called by all HTTP handlers, and by
+// the CLI client before constructing a name-binding envelope.
 func validName(name string) bool {
 	if !nameRe.MatchString(name) {
 		return false
@@ -38,39 +36,38 @@ func validName(name string) bool {
 	return true
 }
 
-// Store holds an age identity and manages the encrypted secret files on disk.
+// ageV1Magic is the fixed literal every age v1 file begins with (verified
+// against filippo.io/age@v1.2.1's internal/format.intro). The server checks
+// only for this prefix — it never attempts to decrypt, so it never
+// constructs or holds any identity, real or otherwise.
+const ageV1Magic = "age-encryption.org/v1\n"
+
+// maxUploadBytes bounds POST /secrets/{name} bodies. The pre-change limit of
+// 64KiB applied to plaintext; since the body is now ciphertext, 96KiB
+// preserves that same effective plaintext headroom after age v1 overhead
+// (a fixed per-recipient header, a 16-byte nonce, and 16 bytes of AEAD tag
+// per 64KiB STREAM chunk) plus the name-binding envelope.
+const maxUploadBytes = 96 * 1024
+
+// errInvalidFormat is returned by Store.setValue when uploaded content does
+// not begin with the age v1 magic. The HTTP handler maps it to a 400 with a
+// generic body — the underlying age library error text is never disclosed.
+var errInvalidFormat = errors.New("content does not begin with the age v1 file format magic")
+
+// Store manages opaque, age-encrypted secret blobs on disk. It holds no
+// identity and performs no encryption or decryption: all cryptography is the
+// responsibility of the CLI client. The server can therefore never read a
+// secret's plaintext value, even with full filesystem access.
 type Store struct {
-	identity   *age.X25519Identity
 	secretsDir string
 }
 
-func newStore(identityFile, secretsDir string) (*Store, error) {
-	data, err := os.ReadFile(identityFile)
-	if err != nil {
-		return nil, fmt.Errorf("read identity: %w", err)
-	}
-
-	ids, err := age.ParseIdentities(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("parse identity: %w", err)
-	}
-	if len(ids) == 0 {
-		return nil, errors.New("no identities found in identity file")
-	}
-
-	id, ok := ids[0].(*age.X25519Identity)
-	if !ok {
-		return nil, errors.New("identity must be an X25519 key")
-	}
-
+func newStore(secretsDir string) (*Store, error) {
 	if err := os.MkdirAll(secretsDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create secrets dir: %w", err)
 	}
-
-	return &Store{identity: id, secretsDir: secretsDir}, nil
+	return &Store{secretsDir: secretsDir}, nil
 }
-
-func (s *Store) publicKey() string { return s.identity.Recipient().String() }
 
 // secretPath returns the absolute path for a secret file, verifying it lies
 // within the secrets directory to prevent path traversal.
@@ -83,30 +80,23 @@ func (s *Store) secretPath(name string) (string, error) {
 	return path, nil
 }
 
-func (s *Store) getValue(name string) (string, error) {
+// getValue returns the stored ciphertext bytes for name, verbatim — no
+// decryption, no trimming, no transformation of any kind.
+func (s *Store) getValue(name string) ([]byte, error) {
 	path, err := s.secretPath(name)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	r, err := age.Decrypt(f, s.identity)
-	if err != nil {
-		return "", fmt.Errorf("decrypt: %w", err)
-	}
-
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, r); err != nil {
-		return "", fmt.Errorf("read decrypted value: %w", err)
-	}
-	return strings.TrimRight(buf.String(), "\n"), nil
+	return os.ReadFile(path)
 }
 
-func (s *Store) setValue(name, value string) error {
+// setValue validates that data begins with the age v1 file magic and, if so,
+// persists it verbatim via an atomic write. The server never encrypts,
+// decrypts, or otherwise transforms the content.
+func (s *Store) setValue(name string, data []byte) error {
+	if !strings.HasPrefix(string(data), ageV1Magic) {
+		return errInvalidFormat
+	}
 	path, err := s.secretPath(name)
 	if err != nil {
 		return err
@@ -114,20 +104,7 @@ func (s *Store) setValue(name, value string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create namespace dir: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return fmt.Errorf("create secret file: %w", err)
-	}
-	defer f.Close()
-
-	w, err := age.Encrypt(f, s.identity.Recipient())
-	if err != nil {
-		return fmt.Errorf("create age writer: %w", err)
-	}
-	if _, err := io.WriteString(w, value); err != nil {
-		return fmt.Errorf("write secret: %w", err)
-	}
-	return w.Close()
+	return writeFileAtomic(path, data)
 }
 
 func (s *Store) removeValue(name string) error {
@@ -181,26 +158,34 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// serve starts the HTTP server using configuration from loadConfig.
-func serve() error {
-	cfg := loadConfig()
+// checkServeConfig validates the configuration serve() needs before it does
+// anything else. Extracted so the guard condition itself — not a hand-copied
+// mirror of it — can be exercised directly by tests.
+func checkServeConfig(cfg Config) error {
 	if cfg.Token == "" {
 		return errors.New("AGED_TOKEN environment variable (or config file token) is required")
 	}
+	return nil
+}
 
-	store, err := newStore(cfg.Identity, cfg.SecretsDir)
+// serve starts the HTTP server using configuration from loadConfig.
+func serve() error {
+	cfg := loadConfig()
+	if err := checkServeConfig(cfg); err != nil {
+		return err
+	}
+
+	log.SetFlags(0) // disable timestamp prefix; journald records its own timestamps
+	warnIfIdentityConfigured(cfg, os.Stderr)
+
+	store, err := newStore(cfg.SecretsDir)
 	if err != nil {
 		return fmt.Errorf("init store: %w", err)
 	}
 
 	addr := cfg.Addr
-	log.SetFlags(0) // disable timestamp prefix; journald records its own timestamps
 	auth := bearerMiddleware(cfg.Token, os.Stderr)
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /pubkey", auth(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintln(w, store.publicKey())
-	}))
 
 	mux.HandleFunc("GET /secrets", auth(func(w http.ResponseWriter, _ *http.Request) {
 		names, err := store.listNames()
@@ -234,7 +219,8 @@ func serve() error {
 			log.Println("get error:", err)
 			return
 		}
-		fmt.Fprint(w, value)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(value)
 	}))
 
 	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
@@ -243,13 +229,22 @@ func serve() error {
 			http.Error(w, "invalid secret name", http.StatusBadRequest)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		value := strings.TrimRight(string(body), "\n")
-		if err := store.setValue(name, value); err != nil {
+		if err := store.setValue(name, body); err != nil {
+			if errors.Is(err, errInvalidFormat) {
+				http.Error(w, "invalid secret format", http.StatusBadRequest)
+				return
+			}
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			log.Println("set error:", err)
 			return
@@ -279,32 +274,20 @@ func serve() error {
 	return newHTTPServer(addr, mux).ListenAndServe()
 }
 
-// initIdentity generates a new X25519 age identity and writes it to disk.
-func initIdentity() error {
-	path := loadConfig().Identity
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("identity file already exists at %s", path)
+// warnIfIdentityConfigured logs a one-line warning if the server was started
+// with an explicitly configured identity/AGED_IDENTITY value. It intentionally
+// does NOT fire merely because a file happens to exist at the default
+// identity path — that path is the correct default location for a
+// client-only identity on a combined server-and-client host, and a warning
+// that fires on every healthy default-path setup would train operators to
+// ignore it.
+func warnIfIdentityConfigured(cfg Config, dst io.Writer) {
+	if !cfg.identityExplicit {
+		return
 	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create directory: %w", err)
-	}
-
-	id, err := age.GenerateX25519Identity()
-	if err != nil {
-		return fmt.Errorf("generate identity: %w", err)
-	}
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
-	if err != nil {
-		return fmt.Errorf("write identity file: %w", err)
-	}
-	defer f.Close()
-
-	fmt.Fprintf(f, "# aged identity — keep this file secret\n%s\n", id)
-	fmt.Printf("public key:  %s\n", id.Recipient())
-	fmt.Printf("identity:    %s\n", path)
-	return nil
+	fmt.Fprintf(dst, "warning: identity/AGED_IDENTITY (%s) is configured but no longer used by aged serve — "+
+		"encryption now happens client-side. Secure or remove this file once migration is verified "+
+		"(see: aged rotate-identity).\n", cfg.Identity)
 }
 
 // sanitiseLogField replaces CR, LF, and all other ASCII control characters

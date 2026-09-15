@@ -8,25 +8,27 @@ import (
 const helpText = `aged — age-encrypted secret server and client
 
 Commands:
-  serve              start the HTTP server
-  init               generate a new age identity key
-  get <name>         fetch a secret value (stdout only — suitable for chezmoi)
-  set <name>         store a secret value (reads from stdin)
-  list               list all secret names
-  delete <name>      delete a secret
-  rotate-token       generate a new token and update the config file in place
+  serve                       start the HTTP server
+  init                        generate a new age identity key (client-side; run on each machine using get/set)
+  get <name>                  fetch a secret value (stdout only — suitable for chezmoi)
+  set <name>                  store a secret value (reads from stdin, encrypted locally before upload)
+  list                        list all secret names
+  delete <name>               delete a secret
+  rotate-token                generate a new token and update the config file in place
+  rotate-identity <file>      re-encrypt every secret from the current identity to a new one
+    [--dry-run]                 (add --dry-run to preview without writing anything)
 
-  pubkey             print the server's age public key
+  pubkey                      print your own local identity's age public key (no network call)
 
 Server environment variables:
   AGED_TOKEN         bearer token for authentication (required)
-  AGED_IDENTITY      path to age identity file (default: ~/.config/aged/identity.age)
   AGED_SECRETS_DIR   path to secrets directory   (default: ~/.config/aged/secrets/)
   AGED_ADDR          listen address              (default: 127.0.0.1:8743)
 
 Client environment variables:
-  AGED_SERVER_URL    server URL    (default: http://localhost:8743)
-  AGED_TOKEN         bearer token  (required)
+  AGED_SERVER_URL    server URL                  (default: http://localhost:8743)
+  AGED_TOKEN         bearer token                (required)
+  AGED_IDENTITY      path to your own age identity file (default: ~/.config/aged/identity.age)
 `
 
 // noArgs exits with an error if unexpected arguments follow a no-argument subcommand.
@@ -35,6 +37,19 @@ func noArgs(cmd string) {
 		fmt.Fprintf(os.Stderr, "%s takes no arguments\nusage: aged %s\n", cmd, cmd)
 		os.Exit(1)
 	}
+}
+
+// parseRotateIdentityArgs extracts the required new-identity-file path and
+// the optional --dry-run flag from rotate-identity's arguments, in any order.
+func parseRotateIdentityArgs(args []string) (newIdentityFile string, dryRun bool) {
+	for _, a := range args {
+		if a == "--dry-run" {
+			dryRun = true
+			continue
+		}
+		newIdentityFile = a
+	}
+	return newIdentityFile, dryRun
 }
 
 func main() {
@@ -78,6 +93,13 @@ func main() {
 	case "rotate-token":
 		noArgs("rotate-token")
 		err = rotateToken(os.Stdout)
+	case "rotate-identity":
+		newIdentityFile, dryRun := parseRotateIdentityArgs(os.Args[2:])
+		if newIdentityFile == "" {
+			fmt.Fprintln(os.Stderr, "usage: aged rotate-identity <new-identity-file> [--dry-run]")
+			os.Exit(1)
+		}
+		err = rotateIdentity(newIdentityFile, dryRun, os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], helpText)
 		os.Exit(1)

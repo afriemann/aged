@@ -20,6 +20,13 @@ type Config struct {
 	SecretsDir string `toml:"secrets_dir"`
 	Addr       string `toml:"addr"`
 	ServerURL  string `toml:"server_url"`
+
+	// identityExplicit records whether Identity was set by the config file
+	// or an environment variable, as opposed to being left empty and later
+	// defaulted. Unexported so BurntSushi/toml ignores it during decoding.
+	// Used solely to gate the stale-identity startup warning in serve() —
+	// see warnIfIdentityConfigured in server.go.
+	identityExplicit bool
 }
 
 // loadConfig returns the effective server configuration. It searches for a
@@ -57,6 +64,12 @@ func loadConfig() Config {
 	if v := os.Getenv("AGED_SERVER_URL"); v != "" {
 		cfg.ServerURL = v
 	}
+
+	// identityExplicit must be captured now, before the default path below
+	// is applied — it is the sole trigger for the stale-identity warning in
+	// serve(), and must not fire merely because a file happens to exist at
+	// the (perfectly normal, client-only) default identity path.
+	cfg.identityExplicit = cfg.Identity != ""
 
 	// Apply defaults for any field still unset.
 	if cfg.Identity == "" {

@@ -147,3 +147,36 @@ func TestLoadConfig_MalformedConfigFileLogsWarning(t *testing.T) {
 		t.Errorf("log output %q: expected the config file path in the warning", logged)
 	}
 }
+
+func TestLoadConfig_IdentityExplicitFlag(t *testing.T) {
+	// spec: Stale Server Identity Warning (identityExplicit gate)
+	t.Run("set via env var", func(t *testing.T) {
+		t.Setenv("AGED_CONFIG", "/tmp/definitely-absent-aged-test.toml")
+		t.Setenv("AGED_IDENTITY", "/some/identity.age")
+		cfg := loadConfig()
+		if !cfg.identityExplicit {
+			t.Error("expected identityExplicit=true when AGED_IDENTITY is set")
+		}
+	})
+
+	t.Run("set via config file", func(t *testing.T) {
+		dir := t.TempDir()
+		cfgFile := filepath.Join(dir, "config.toml")
+		os.WriteFile(cfgFile, []byte(`identity = "/some/identity.age"`+"\n"), 0o600)
+		t.Setenv("AGED_CONFIG", cfgFile)
+		t.Setenv("AGED_IDENTITY", "")
+		cfg := loadConfig()
+		if !cfg.identityExplicit {
+			t.Error("expected identityExplicit=true when config file sets identity")
+		}
+	})
+
+	t.Run("left at default", func(t *testing.T) {
+		t.Setenv("AGED_CONFIG", "/tmp/definitely-absent-aged-test.toml")
+		t.Setenv("AGED_IDENTITY", "")
+		cfg := loadConfig()
+		if cfg.identityExplicit {
+			t.Error("expected identityExplicit=false when identity was never set")
+		}
+	})
+}
