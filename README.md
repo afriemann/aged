@@ -161,16 +161,16 @@ If you're upgrading an existing aged deployment whose server previously held its
 8. **Copy the migrated scratch secrets directory back to the server**, into the now-empty `secrets_dir` path, preserving ownership/permissions (`0700` dirs, `0600` files, owned by whatever user runs `aged serve`).
 9. **Securely delete the transient scratch copy from the client** — the copied-down old identity and pre-migration ciphertext have served their purpose and should not linger.
 10. **Start `aged serve`.** Confirm the stale-identity warning fires only if you still have `identity`/`AGED_IDENTITY` configured for the server — remove that setting either way, since it's unused now.
-11. **Destroy the old server-held identity file — unconditionally, even if you never explicitly configured `identity`.** If you always relied on the default path (`~/.config/aged/identity.age` on the server host), that file is the old private key and the stale-identity warning will *not* fire for it (by design — see Configuration above). Move it, rename it, or delete it, and confirm it's gone.
-12. **Distribute the client's new identity file to every *other* client machine** that runs `get`/`set` (it already lives on the one that generated it in step 3). This file is now strictly more sensitive than the bearer token — its compromise is total and irreversible short of running `rotate-identity` again:
+11. **Verify** a real `aged get` works from the client machine using the new identity, against the live server — **before** destroying anything irreversible below. If this fails, you can still recover: the server-side backup from step 7 and the (not yet destroyed) old identity are both still in place.
+12. **Only once verified**, destroy the old server-held identity file — unconditionally, even if you never explicitly configured `identity`. If you always relied on the default path (`~/.config/aged/identity.age` on the server host), that file is the old private key and the stale-identity warning will *not* fire for it (by design — see Configuration above). Move it, rename it, or delete it, and confirm it's gone. **This is the point of no return** — the server-side `secrets.old-<timestamp>/` backup from step 7 becomes permanently undecryptable the moment this identity is gone, so do not reach this step until step 11 has actually succeeded.
+13. **Distribute the client's new identity file to every *other* client machine** that runs `get`/`set` (it already lives on the one that generated it in step 3). This file is now strictly more sensitive than the bearer token — its compromise is total and irreversible short of running `rotate-identity` again:
     - transfer over an already-authenticated, confidentiality-and-integrity-protected channel (e.g. an existing SSH session to a known-host-verified machine) — not a channel whose only property is "the same one used for the token";
     - verify file mode `0600` and correct ownership *on arrival* at each destination;
     - never use a channel that leaves a durable unencrypted copy — chat tools, tickets, email, shared drives, or pasted terminal scrollback are all unsuitable;
     - back up the identity file with at least the rigour you apply to the `rotate-token` runbook — losing it means losing every secret.
-13. **Verify** a real `aged get` works from a real client machine using the new identity, against the live server.
-14. **Only then** delete the server-side `secrets.old-<timestamp>/` backup from step 7 and securely destroy the old identity file if you haven't already.
+14. **Only then** delete the server-side `secrets.old-<timestamp>/` backup from step 7 (the old identity should already be gone from step 12).
 
-**Rollback** (only possible before step 14, and only if you kept the step-7 backup): stop the service, move `secrets.old-<timestamp>` back into place as `secrets_dir`, restore the previous binary and the old `identity` config setting, restart.
+**Rollback** (only possible before step 12 — destroying the old identity is what closes this window, since `secrets.old-<timestamp>/` becomes permanently undecryptable the moment it's gone, regardless of whether you've also deleted the directory yet): stop the service, move `secrets.old-<timestamp>` back into place as `secrets_dir`, restore the previous binary and the old `identity` config setting, restart.
 
 ## chezmoi integration
 
