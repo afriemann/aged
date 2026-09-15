@@ -141,32 +141,36 @@ aged rotate-token
 
 ## Migrating to client-side encryption
 
-If you're upgrading an existing aged deployment whose server previously held its own identity, follow this runbook **before** switching to the new binary in production. All commands below run on the machine that currently holds the server's identity and secrets (typically the server host itself).
+If you're upgrading an existing aged deployment whose server previously held its own identity, follow this runbook **before** switching to the new binary in production.
+
+**The new identity must be generated on, and never leave, an actual client machine** — not the server. `aged rotate-identity` needs the new identity's *private* key present wherever it runs (it decrypts its own freshly re-encrypted output to verify before swapping anything), so **run the migration itself on that same client machine**, not on the server — otherwise the server ends up holding the very private key this change exists to keep it from ever seeing, even if only transiently.
 
 1. **Deploy the new binary** to the server host and to every client machine — this is a breaking wire-format change; do not run mismatched versions against each other.
 2. **Stop `aged serve`.**
-3. **Generate a new, client-side identity** — `aged init` against a new path (or reuse an identity you've already generated on your primary client machine).
-4. **Dry run first:**
+3. **On the client machine you intend to use going forward, generate its identity:** `aged init`. This key is born here and stays here — it is never copied to or generated on the server, including during the steps below.
+4. **Temporarily copy the server's current ciphertext store and its old identity file to that same client machine**, over an already-authenticated channel (e.g. `scp` over an existing SSH session to a known-host-verified server), into a scratch location distinct from the client's own `secrets_dir`/`identity` — e.g. `~/aged-migration-scratch/{secrets,old-identity.age}`. The server's originals are left in place untouched at this point.
+5. **Dry run, on the client, against the scratch copy:**
    ```sh
-   aged rotate-identity /path/to/new-identity.age --dry-run
+   AGED_IDENTITY=~/aged-migration-scratch/old-identity.age \
+   AGED_SECRETS_DIR=~/aged-migration-scratch/secrets \
+     aged rotate-identity ~/.config/aged/identity.age --dry-run
    ```
-   Confirm the reported count matches the number of secrets you expect, with zero failures.
-5. **Run it for real:**
-   ```sh
-   aged rotate-identity /path/to/new-identity.age
-   ```
-   This stages every secret, verifies each one individually, then swaps the whole store atomically. The previous store is kept as a timestamped `secrets.old-<timestamp>/` backup — nothing is deleted yet.
-6. **Start `aged serve`.** Confirm the stale-identity warning fires only if you still have `identity`/`AGED_IDENTITY` configured for the server — remove that setting either way, since it's unused now.
-7. **Destroy the old server-held identity file — unconditionally, even if you never explicitly configured `identity`.** If you always relied on the default path (`~/.config/aged/identity.age` on the server host), that file is the old private key and the stale-identity warning will *not* fire for it (by design — see Configuration above). Move it, rename it, or delete it, and confirm it's gone.
-8. **Distribute the new identity file to every client machine** that runs `get`/`set`. This file is now strictly more sensitive than the bearer token — its compromise is total and irreversible short of running `rotate-identity` again:
-   - transfer over an already-authenticated, confidentiality-and-integrity-protected channel (e.g. an existing SSH session to a known-host-verified machine) — not a channel whose only property is "the same one used for the token";
-   - verify file mode `0600` and correct ownership *on arrival* at each destination;
-   - never use a channel that leaves a durable unencrypted copy — chat tools, tickets, email, shared drives, or pasted terminal scrollback are all unsuitable;
-   - back up the identity file with at least the rigour you apply to the `rotate-token` runbook — losing it means losing every secret.
-9. **Verify** a real `aged get` works from a real client machine using the new identity.
-10. **Only then** delete `secrets.old-<timestamp>/` and securely destroy the old identity file.
+   Confirm the reported count matches the number of secrets you expect, with zero failures. (`~/.config/aged/identity.age` here is the identity you just generated in step 3 — the target of the migration, not something copied from the server.)
+6. **Run it for real** (same command, without `--dry-run`). This stages every secret, verifies each one individually against the client's own new identity, then swaps the *scratch copy* atomically — the client's new private key never leaves this machine at any point in this process.
+7. **On the server, make room for the migrated store**: rename the live `secrets_dir` aside as your own backup (e.g. `mv /path/to/secrets /path/to/secrets.old-<timestamp>`) — this is the server-side equivalent of the atomic-swap backup `rotate-identity` would have made if it had run in place, and gives you the same rollback safety net.
+8. **Copy the migrated scratch secrets directory back to the server**, into the now-empty `secrets_dir` path, preserving ownership/permissions (`0700` dirs, `0600` files, owned by whatever user runs `aged serve`).
+9. **Securely delete the transient scratch copy from the client** — the copied-down old identity and pre-migration ciphertext have served their purpose and should not linger.
+10. **Start `aged serve`.** Confirm the stale-identity warning fires only if you still have `identity`/`AGED_IDENTITY` configured for the server — remove that setting either way, since it's unused now.
+11. **Destroy the old server-held identity file — unconditionally, even if you never explicitly configured `identity`.** If you always relied on the default path (`~/.config/aged/identity.age` on the server host), that file is the old private key and the stale-identity warning will *not* fire for it (by design — see Configuration above). Move it, rename it, or delete it, and confirm it's gone.
+12. **Distribute the client's new identity file to every *other* client machine** that runs `get`/`set` (it already lives on the one that generated it in step 3). This file is now strictly more sensitive than the bearer token — its compromise is total and irreversible short of running `rotate-identity` again:
+    - transfer over an already-authenticated, confidentiality-and-integrity-protected channel (e.g. an existing SSH session to a known-host-verified machine) — not a channel whose only property is "the same one used for the token";
+    - verify file mode `0600` and correct ownership *on arrival* at each destination;
+    - never use a channel that leaves a durable unencrypted copy — chat tools, tickets, email, shared drives, or pasted terminal scrollback are all unsuitable;
+    - back up the identity file with at least the rigour you apply to the `rotate-token` runbook — losing it means losing every secret.
+13. **Verify** a real `aged get` works from a real client machine using the new identity, against the live server.
+14. **Only then** delete the server-side `secrets.old-<timestamp>/` backup from step 7 and securely destroy the old identity file if you haven't already.
 
-**Rollback** (only possible before step 10): stop the service, `mv secrets.old-<timestamp> secrets`, restore the previous binary and the old `identity` config setting, restart.
+**Rollback** (only possible before step 14, and only if you kept the step-7 backup): stop the service, move `secrets.old-<timestamp>` back into place as `secrets_dir`, restore the previous binary and the old `identity` config setting, restart.
 
 ## chezmoi integration
 
