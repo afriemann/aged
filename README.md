@@ -12,7 +12,9 @@ make install PREFIX=~/.local
 
 ## Server setup (on homebox)
 
-The service unit uses `StateDirectory=aged` — systemd creates and owns `/var/lib/aged` automatically on first start. Do **not** use home-directory paths for identity or secrets; the hardened unit sets `ProtectHome=yes` which makes `/home`, `/root`, and `/run/user` inaccessible to the process.
+The service unit uses `StateDirectory=aged` — systemd creates and owns `/var/lib/aged` automatically on first start. Do **not** use home-directory paths for secrets; the hardened unit sets `ProtectHome=yes` which makes `/home`, `/root`, and `/run/user` inaccessible to the process.
+
+**The server never holds an age identity.** All encryption and decryption happen on the client — the server stores and returns opaque ciphertext only, and cannot decrypt any secret even with full filesystem access. There is no `aged init` step on the server.
 
 **1. Install the unit and let systemd create the directories:**
 
@@ -23,20 +25,11 @@ sudo systemctl start aged   # creates /var/lib/aged and /etc/aged; will fail (no
 sudo systemctl stop aged
 ```
 
-**2. Generate an identity key into `/var/lib/aged`:**
-
-```sh
-sudo -u aged AGED_IDENTITY=/var/lib/aged/identity.age aged init
-# public key:  age1xxxx...
-# identity:    /var/lib/aged/identity.age
-```
-
-**3. Create `/etc/aged/config.toml`** (mode 0600):
+**2. Create `/etc/aged/config.toml`** (mode 0600):
 
 ```sh
 sudo tee /etc/aged/config.toml <<'EOF'
 token       = "<generate with: openssl rand -hex 32>"
-identity    = "/var/lib/aged/identity.age"
 secrets_dir = "/var/lib/aged/secrets"
 addr        = "127.0.0.1:8743"
 EOF
@@ -44,19 +37,19 @@ sudo chmod 600 /etc/aged/config.toml
 sudo chown aged:aged /etc/aged/config.toml
 ```
 
-**4. Start and enable the service:**
+**3. Start and enable the service:**
 
 ```sh
 sudo systemctl enable --now aged
 ```
 
-**5. Verify confinement (optional but recommended):**
+**4. Verify confinement (optional but recommended):**
 
 ```sh
 systemd-analyze security aged.service
 ```
 
-**6. Put it behind your reverse proxy** (Caddy example):
+**5. Put it behind your reverse proxy** (Caddy example):
 
 ```
 secrets.home.example.com {
@@ -66,16 +59,7 @@ secrets.home.example.com {
 }
 ```
 
-**Migrating from a home-directory deployment:** If you previously stored identity/secrets under `~/.config/aged/`, move them and fix ownership before restarting under the hardened unit:
-
-```sh
-sudo systemctl stop aged
-sudo mv /home/<user>/.config/aged/identity.age /var/lib/aged/
-sudo mv /home/<user>/.config/aged/secrets       /var/lib/aged/
-sudo chown -R aged:aged /var/lib/aged            # critical — moved files keep old owner
-# update /etc/aged/config.toml to point at /var/lib/aged paths
-sudo systemctl start aged
-```
+**Migrating an existing (pre-client-side-encryption) deployment:** if you're upgrading a server that previously held its own identity, see [Migrating to client-side encryption](#migrating-to-client-side-encryption) before installing the new binary — you need to re-encrypt your existing secrets onto a new, client-held identity first.
 
 ## Configuration
 
@@ -86,28 +70,31 @@ aged can be configured via a TOML config file, environment variables, or both. E
 2. `/etc/aged/config.toml` — system-wide
 3. `~/.config/aged/config.toml` — user
 
-**Example `/etc/aged/config.toml`:**
+> **Note for a combined server+client host:** `configFilePath()` checks `/etc/aged/config.toml` *before* `~/.config/aged/config.toml`. If you run client commands (`get`/`set`/`pubkey`) on the same machine that runs `aged serve`, make sure your shell user doesn't pick up the server's config file — a client's `identity` must never point at the server's old (pre-migration) identity path. Run client commands with `$AGED_CONFIG` pointed explicitly at your own `~/.config/aged/config.toml` if there's any ambiguity.
+
+**Example `/etc/aged/config.toml`** (server — no `identity` key; the server never holds one):
 
 ```toml
 token       = "your-bearer-token"
-identity    = "/var/lib/aged/identity.age"
 secrets_dir = "/var/lib/aged/secrets"
 addr        = "127.0.0.1:8743"
 ```
 
 **Environment variable overrides:**
 
-| Variable | Config key | Default |
-|---|---|---|
-| `AGED_TOKEN` | `token` | — (**required**) |
-| `AGED_IDENTITY` | `identity` | `~/.config/aged/identity.age` |
-| `AGED_SECRETS_DIR` | `secrets_dir` | `~/.config/aged/secrets/` |
-| `AGED_ADDR` | `addr` | `127.0.0.1:8743` |
+| Variable | Config key | Default | Used by |
+|---|---|---|---|
+| `AGED_TOKEN` | `token` | — (**required**) | server + client |
+| `AGED_SECRETS_DIR` | `secrets_dir` | `~/.config/aged/secrets/` | server |
+| `AGED_ADDR` | `addr` | `127.0.0.1:8743` | server |
+| `AGED_IDENTITY` | `identity` | `~/.config/aged/identity.age` | **client only** — `get`/`set`/`pubkey`/`rotate-identity` |
+| `AGED_SERVER_URL` | `server_url` | `http://localhost:8743` | client |
+
+If `identity`/`AGED_IDENTITY` is still set for `aged serve`, the server logs a startup warning naming the file — it's unused and should be secured or removed once you've verified migration (see below).
 
 ## Client usage
 
-
-Create `~/.config/aged/config.toml` (mode 0600) — no environment variables needed:
+Create `~/.config/aged/config.toml` (mode 0600):
 
 ```toml
 token      = "your-bearer-token"
@@ -118,13 +105,23 @@ server_url = "https://aged.automate.wtf"
 chmod 600 ~/.config/aged/config.toml
 ```
 
-Environment variables (`AGED_TOKEN`, `AGED_SERVER_URL`) still override the config file when set.
+Environment variables (`AGED_TOKEN`, `AGED_SERVER_URL`, `AGED_IDENTITY`) still override the config file when set.
+
+**Generate your own identity — once, on each machine you'll run `get`/`set` from:**
 
 ```sh
-# Store a secret
+aged init
+# public key:  age1xxxx...
+# identity:    ~/.config/aged/identity.age
+```
+
+This identity never leaves your machine. All encryption and decryption happen locally — the server only ever stores and returns ciphertext.
+
+```sh
+# Store a secret (encrypted locally before upload)
 echo -n "my-token-value" | aged set ha-token
 
-# Retrieve it
+# Retrieve it (downloaded ciphertext is decrypted locally)
 aged get ha-token
 
 # List all secrets
@@ -133,12 +130,43 @@ aged list
 # Delete
 aged delete ha-token
 
-# Show server's public key
+# Show your own public key (reads your local identity file — no network call)
 aged pubkey
 
 # Rotate the bearer token (run on server, then restart + update client configs)
 aged rotate-token
 ```
+
+**Using aged from more than one machine:** copy your `identity.age` file to every machine you run `get`/`set` from, protected with at least the rigour you'd apply to the bearer token — see [Migrating to client-side encryption](#migrating-to-client-side-encryption) for concrete guidance, since the identity file is now more sensitive than the token.
+
+## Migrating to client-side encryption
+
+If you're upgrading an existing aged deployment whose server previously held its own identity, follow this runbook **before** switching to the new binary in production. All commands below run on the machine that currently holds the server's identity and secrets (typically the server host itself).
+
+1. **Deploy the new binary** to the server host and to every client machine — this is a breaking wire-format change; do not run mismatched versions against each other.
+2. **Stop `aged serve`.**
+3. **Generate a new, client-side identity** — `aged init` against a new path (or reuse an identity you've already generated on your primary client machine).
+4. **Dry run first:**
+   ```sh
+   aged rotate-identity /path/to/new-identity.age --dry-run
+   ```
+   Confirm the reported count matches the number of secrets you expect, with zero failures.
+5. **Run it for real:**
+   ```sh
+   aged rotate-identity /path/to/new-identity.age
+   ```
+   This stages every secret, verifies each one individually, then swaps the whole store atomically. The previous store is kept as a timestamped `secrets.old-<timestamp>/` backup — nothing is deleted yet.
+6. **Start `aged serve`.** Confirm the stale-identity warning fires only if you still have `identity`/`AGED_IDENTITY` configured for the server — remove that setting either way, since it's unused now.
+7. **Destroy the old server-held identity file — unconditionally, even if you never explicitly configured `identity`.** If you always relied on the default path (`~/.config/aged/identity.age` on the server host), that file is the old private key and the stale-identity warning will *not* fire for it (by design — see Configuration above). Move it, rename it, or delete it, and confirm it's gone.
+8. **Distribute the new identity file to every client machine** that runs `get`/`set`. This file is now strictly more sensitive than the bearer token — its compromise is total and irreversible short of running `rotate-identity` again:
+   - transfer over an already-authenticated, confidentiality-and-integrity-protected channel (e.g. an existing SSH session to a known-host-verified machine) — not a channel whose only property is "the same one used for the token";
+   - verify file mode `0600` and correct ownership *on arrival* at each destination;
+   - never use a channel that leaves a durable unencrypted copy — chat tools, tickets, email, shared drives, or pasted terminal scrollback are all unsuitable;
+   - back up the identity file with at least the rigour you apply to the `rotate-token` runbook — losing it means losing every secret.
+9. **Verify** a real `aged get` works from a real client machine using the new identity.
+10. **Only then** delete `secrets.old-<timestamp>/` and securely destroy the old identity file.
+
+**Rollback** (only possible before step 10): stop the service, `mv secrets.old-<timestamp> secrets`, restore the previous binary and the old `identity` config setting, restart.
 
 ## chezmoi integration
 

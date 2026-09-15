@@ -3,51 +3,49 @@ package main
 // spec: openspec/changes/namespace-support/specs/aged/spec.md
 
 import (
+	"bytes"
 	"net/http"
 	"os"
-	"strings"
 	"testing"
 )
 
 func TestStore_NamespacedRoundTrip(t *testing.T) {
 	// spec: Namespaced Secret Names — Namespaced secret round-trip
 	store := testStore(t)
-	if err := store.setValue("ha/token", "secret-value"); err != nil {
+	want := testCiphertext(t, "secret-value")
+	if err := store.setValue("ha/token", want); err != nil {
 		t.Fatalf("setValue: %v", err)
 	}
 	got, err := store.getValue("ha/token")
 	if err != nil {
 		t.Fatalf("getValue: %v", err)
 	}
-	if got != "secret-value" {
-		t.Errorf("got %q, want %q", got, "secret-value")
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
 func TestStore_DeeplyNestedNamespace(t *testing.T) {
 	// spec: Namespaced Secret Names — Deeply nested namespace
 	store := testStore(t)
-	if err := store.setValue("infra/db/password", "db-pass"); err != nil {
+	want := testCiphertext(t, "db-pass")
+	if err := store.setValue("infra/db/password", want); err != nil {
 		t.Fatalf("setValue: %v", err)
 	}
 	got, err := store.getValue("infra/db/password")
 	if err != nil {
 		t.Fatalf("getValue: %v", err)
 	}
-	if got != "db-pass" {
-		t.Errorf("got %q, want %q", got, "db-pass")
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
 func TestStore_ListReturnsNamespacedNames(t *testing.T) {
 	// spec: Namespaced Secret Names — List returns namespaced names
 	store := testStore(t)
-	for name, val := range map[string]string{
-		"ha/token":     "t1",
-		"ha/client-id": "t2",
-		"grafana/key":  "t3",
-	} {
-		if err := store.setValue(name, val); err != nil {
+	for _, name := range []string{"ha/token", "ha/client-id", "grafana/key"} {
+		if err := store.setValue(name, testCiphertext(t, name)); err != nil {
 			t.Fatalf("setValue %s: %v", name, err)
 		}
 	}
@@ -67,15 +65,15 @@ func TestStore_ListReturnsNamespacedNames(t *testing.T) {
 func TestStore_DeleteRemovesEmptyNamespaceDir(t *testing.T) {
 	// spec: Namespaced Secret Names — Delete removes empty namespace directories
 	store := testStore(t)
-	if err := store.setValue("ns/only", "v"); err != nil {
+	if err := store.setValue("ns/only", testCiphertext(t, "v")); err != nil {
 		t.Fatalf("setValue: %v", err)
 	}
 	if err := store.removeValue("ns/only"); err != nil {
 		t.Fatalf("removeValue: %v", err)
 	}
 	// The ns/ directory should no longer exist.
-	import_path := store.secretsDir + "/ns"
-	if _, err := os.Stat(import_path); err == nil {
+	nsDir := store.secretsDir + "/ns"
+	if _, err := os.Stat(nsDir); err == nil {
 		t.Error("empty namespace directory was not removed")
 	}
 }
@@ -85,7 +83,7 @@ func TestServer_NamespaceEndpointRoundTrip(t *testing.T) {
 	srv, _ := testServer(t)
 
 	resp := do(t, srv, http.MethodPost, "/secrets/ha/token", testToken,
-		strings.NewReader("ha-token-value"))
+		bytes.NewReader(testCiphertext(t, "ha-token-value")))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("POST got %d, want 204", resp.StatusCode)
