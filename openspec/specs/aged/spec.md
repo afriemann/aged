@@ -280,6 +280,8 @@ The system SHALL generate a new cryptographically random 32-byte hex token, writ
 
 The update SHALL be written atomically: the new content SHALL be staged to a temporary file in the same directory as the config file, the temporary file SHALL be set to mode 0600, and then it SHALL be renamed to replace the original. If any step between staging and rename fails, the temporary file SHALL be removed and the original config file SHALL remain unchanged.
 
+The rewritten config file SHALL retain the same owning user and group as the original file, regardless of which user invokes `aged rotate-token`. If the original owner cannot be applied to the staged file, the command SHALL fail before renaming into place, leaving the original config file unchanged.
+
 #### Scenario: Rotates token in config file
 
 GIVEN a config file exists at a standard path containing a token
@@ -309,6 +311,13 @@ AND an error occurs while writing the staged temporary file
 WHEN `aged rotate-token` is run
 THEN the original config file is unchanged
 AND no stray temporary file remains in the config file's directory
+
+#### Scenario: Preserves file ownership across rotation
+
+GIVEN a config file exists, owned by a specific user and group
+WHEN `aged rotate-token` is run
+THEN the rewritten config file retains the same owning user and group as the original
+AND this holds regardless of which user account invoked the command
 
 ### Requirement: Namespaced Secret Names
 
