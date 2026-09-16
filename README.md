@@ -1,5 +1,7 @@
 # aged
 
+[![CI](https://github.com/afriemann/aged/actions/workflows/ci.yml/badge.svg)](https://github.com/afriemann/aged/actions/workflows/ci.yml)
+
 A small age-encrypted secret server. Secrets are stored as age-encrypted files on disk; a lightweight HTTP API exposes them to any machine on your network. Designed to be used as a [chezmoi](https://chezmoi.io) secret backend.
 
 ## Install
