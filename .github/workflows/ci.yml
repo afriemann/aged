@@ -41,3 +41,13 @@ jobs:
 
       - name: Test (race detector)
         run: go test -race ./...
+
+      # If this step fails unexpectedly on its first few runs with an
+      # internal go/packages type-resolution error rather than a real
+      # vulnerability finding, check for a stale Actions runner cache
+      # before assuming a real CVE was found.
+      - name: Vulnerability scan (govulncheck)
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          repo-checkout: false
