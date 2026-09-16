@@ -112,3 +112,73 @@ func TestServer_InvalidNameDotDotSegmentRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestStore_NameContainingLiteralDotsAccepted(t *testing.T) {
+	// spec: Namespaced Secret Names — Name containing literal dots is accepted
+	store := testStore(t)
+	want := testCiphertext(t, "dots-value")
+	if err := store.setValue("..foo", want); err != nil {
+		t.Fatalf("setValue(\"..foo\"): %v", err)
+	}
+	got, err := store.getValue("..foo")
+	if err != nil {
+		t.Fatalf("getValue(\"..foo\"): %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestStore_SymlinkEscapingStoreRootRejected(t *testing.T) {
+	// spec: Namespaced Secret Names — Symlink escaping the store root is rejected
+	store := testStore(t)
+
+	outside := t.TempDir()
+	outsideFile := outside + "/secret.age"
+	if err := os.WriteFile(outsideFile, testCiphertext(t, "outside-value"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+
+	linkPath := store.secretsDir + "/escape.age"
+	if err := os.Symlink(outsideFile, linkPath); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if _, err := store.getValue("escape"); err == nil {
+		t.Error("getValue via symlink escaping root: want error, got nil")
+	}
+	if err := store.removeValue("escape"); err == nil {
+		t.Error("removeValue via symlink escaping root: want error, got nil")
+	}
+
+	// setValue: point the *namespace directory* at a symlink escaping the
+	// root, since setValue resolves the parent directory (the leaf file
+	// need not exist yet).
+	os.Remove(linkPath)
+	outsideDir := t.TempDir()
+	if err := os.Symlink(outsideDir, store.secretsDir+"/escapedir"); err != nil {
+		t.Fatalf("symlink dir: %v", err)
+	}
+	if err := store.setValue("escapedir/secret", testCiphertext(t, "v")); err == nil {
+		t.Error("setValue via symlinked namespace dir escaping root: want error, got nil")
+	}
+}
+
+func TestStore_RootSurvivesCleanupRegardlessOfTrailingSeparator(t *testing.T) {
+	// spec: Namespaced Secret Names — Store root survives cleanup regardless of trailing separator
+	dir := t.TempDir()
+	secretsDir := dir + "/secrets/" // trailing separator
+	store, err := newStore(secretsDir)
+	if err != nil {
+		t.Fatalf("newStore: %v", err)
+	}
+	if err := store.setValue("ns/only", testCiphertext(t, "v")); err != nil {
+		t.Fatalf("setValue: %v", err)
+	}
+	if err := store.removeValue("ns/only"); err != nil {
+		t.Fatalf("removeValue: %v", err)
+	}
+	if _, err := os.Stat(store.secretsDir); err != nil {
+		t.Errorf("store root was removed: %v", err)
+	}
+}

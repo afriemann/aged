@@ -1,75 +1,40 @@
-# aged — Secret Server
+## MODIFIED Requirements
 
-## Purpose
+### Requirement: Environment Variable Configuration
 
-aged is a small HTTP server that stores secrets as age-encrypted files on disk and exposes them to authenticated clients. A companion CLI provides `get`, `set`, `list`, `delete`, and `pubkey` commands that call the server. The primary integration target is chezmoi's `[secret]` backend: `aged get <name>` prints the plaintext value to stdout with no trailing newline.
+The server SHALL read its runtime configuration from environment variables. When a config file is also present, environment variables take precedence over config file values. The following defaults apply when a value is absent from both sources. `identity`/`AGED_IDENTITY` is a client-only setting: it configures which identity file `get`, `set`, `pubkey`, and `rotate-identity` use, and `aged serve` SHALL NOT read or require it to start.
 
-## Requirements
+`token`/`AGED_TOKEN` is the CLI client's own credential and is read by every client command (`get`/`set`/`list`/`delete`) exactly as before. `aged serve` SHALL NOT treat a bare `token` value as an implicit tenant: server-side users come exclusively from the `[[users]]` config array and/or the `AGED_USERNAME`/`AGED_TOKEN` environment pair (see Multi-User Configuration). If `AGED_USERNAME` is set without `AGED_TOKEN`, or `AGED_TOKEN` is set without `AGED_USERNAME`, `aged serve` SHALL refuse to start with an error naming which of the two is missing.
 
-### Requirement: Identity Initialisation
+| Variable | Config key | Default |
+|---|---|---|
+| `AGED_TOKEN` | `token` | — (client credential; combines with `AGED_USERNAME` to define one server user) |
+| `AGED_USERNAME` | — | — (server-only; combines with `AGED_TOKEN` to define one server user) |
+| `AGED_IDENTITY` | `identity` | `~/.config/aged/identity.age` (client-only) |
+| `AGED_SECRETS_DIR` | `secrets_dir` | `~/.config/aged/secrets/` |
+| `AGED_ADDR` | `addr` | `127.0.0.1:8743` |
+| `AGED_SERVER_URL` | `server_url` | `http://localhost:8743` |
 
-The system SHALL generate a new X25519 age identity when `aged init` is run, writing the private key to the configured identity file with mode 0600, and print the public key to stdout. This identity is used exclusively by client-side operations (`get`, `set`, `pubkey`, `rotate-identity`) to encrypt and decrypt secret values; the server (`aged serve`) neither generates, reads, nor requires an identity to operate.
+#### Scenario: Missing token on startup
+GIVEN no `[[users]]` entries are configured, and neither `AGED_TOKEN` nor `AGED_USERNAME` is set
+WHEN `aged serve` is run
+THEN the server exits with a non-zero code and an informative error message
 
-#### Scenario: Generate new identity
-GIVEN no identity file exists at the configured path
-WHEN `aged init` is run
-THEN a new 0600 identity file is written
-AND the public key is printed to stdout
+#### Scenario: Server starts without any identity configured
+GIVEN neither `AGED_IDENTITY` nor a config file `identity` key is set
+AND `AGED_TOKEN` and `AGED_USERNAME` are both set, defining one user
+WHEN `aged serve` is run
+THEN the server starts successfully
 
-#### Scenario: Refuse to overwrite existing identity
-GIVEN an identity file already exists at the configured path
-WHEN `aged init` is run
-THEN the command exits with a non-zero code
-AND the existing identity file is unchanged
+#### Scenario: AGED_USERNAME without AGED_TOKEN refused
+GIVEN `AGED_USERNAME` is set and `AGED_TOKEN` is not set
+WHEN `aged serve` is run
+THEN the server exits with a non-zero code naming `AGED_TOKEN` as the missing value
 
-### Requirement: Secret Storage
-
-The system SHALL validate that uploaded secret content begins with the age v1 file format magic (`age-encryption.org/v1\n`) and persist it verbatim as a `.age` file in the configured secrets directory, creating the directory with mode 0700 if absent. The server SHALL NOT encrypt, decrypt, or otherwise transform the content in any way — encryption and decryption happen exclusively on the client. The write SHALL be atomic: content is staged to a temporary file in the same directory, set to mode 0600, then renamed into place; a failure at any point before the rename SHALL leave the previously stored value (if any) unchanged and SHALL leave no temporary file behind.
-
-#### Scenario: Store and retrieve round-trip
-GIVEN a valid secret name and age-v1-formatted ciphertext bytes
-WHEN the ciphertext is stored then retrieved
-THEN the retrieved bytes equal the originally stored ciphertext exactly, with no trimming or transformation
-
-#### Scenario: Overwrite existing secret
-GIVEN a secret name already has stored ciphertext
-WHEN new ciphertext is stored under the same name
-THEN only the new ciphertext is returned on subsequent retrieval
-
-#### Scenario: Failed write leaves the previous value intact
-GIVEN a secret name already has stored ciphertext
-AND an error occurs while writing the staged temporary file for a new value
-WHEN the store attempts to persist the new value
-THEN the previously stored ciphertext is unchanged
-AND no stray temporary file remains in the secrets directory
-
-### Requirement: Secret Retrieval
-
-The system SHALL return the stored ciphertext bytes of a named secret verbatim, with no decryption, transformation, or trimming performed by the server.
-
-#### Scenario: Retrieve existing secret
-GIVEN a secret that has been stored
-WHEN the secret is retrieved by name
-THEN the stored ciphertext bytes are returned exactly as stored
-
-#### Scenario: Retrieve non-existent secret
-GIVEN a name that has no stored secret
-WHEN retrieval is attempted
-THEN an error is returned indicating the secret was not found
-
-### Requirement: Secret Deletion
-
-The system SHALL remove the `.age` file for a named secret.
-
-#### Scenario: Delete existing secret
-GIVEN a secret that has been stored
-WHEN the secret is deleted by name
-THEN subsequent retrieval returns a not-found error
-
-#### Scenario: Delete non-existent secret
-GIVEN a name that has no stored secret
-WHEN deletion is attempted
-THEN an error is returned indicating the secret was not found
+#### Scenario: AGED_TOKEN without AGED_USERNAME refused
+GIVEN `AGED_TOKEN` is set and `AGED_USERNAME` is not set
+WHEN `aged serve` is run
+THEN the server exits with a non-zero code naming `AGED_USERNAME` as the missing value
 
 ### Requirement: Secret Listing
 
@@ -182,118 +147,59 @@ GIVEN two or more users are configured
 WHEN a request carries the last configured user's correct token
 THEN the server accepts the request and routes it to that user's own secrets store
 
-### Requirement: Secret Name Validation
+### Requirement: Namespaced Secret Names
 
-The server SHALL reject any secret name that contains characters outside `[a-zA-Z0-9._-]` or `/` (per the namespace rules), returning HTTP 400. This prevents path traversal and shell injection via the `.age` filename. The CLI client SHALL apply the identical validation rule locally before constructing the client-side encryption envelope for a `set` operation, so that an invalid name is rejected before any network request is made and before it can be embedded in the envelope's name-binding header.
+Secret names SHALL support `/` as a namespace separator. Each segment between `/` characters SHALL match `[a-zA-Z0-9._-]+`. Names with empty segments, leading or trailing slashes, or any segment equal to `..` SHALL be rejected with HTTP 400. The store SHALL persist namespaced secrets as a subdirectory tree (e.g. `ha/token` → `ha/token.age` under the secrets directory).
 
-#### Scenario: Valid name accepted
-GIVEN a secret name matching `[a-zA-Z0-9._-]+`
-WHEN the name is used in any secrets endpoint
-THEN the request is processed normally
+The resolved file path SHALL be verified to lie within the secrets directory before any file operation, using the precise form of the containment check (`rel == ".."`, or `rel` begins with `".."` followed by the path separator) so that a legitimate name containing literal dots (e.g. `..foo`, a valid segment under the character class above) is never rejected. This verification SHALL additionally resolve symlinks: for an operation on an existing file, the resolved (symlink-free) path SHALL be re-verified to lie within the store's own symlink-resolved root; for a new file being created, the resolved (symlink-free) parent directory SHALL be re-verified instead. A symlink whose resolved target lies outside the store's root SHALL be rejected on every operation (get, set, delete).
 
-#### Scenario: Invalid name rejected
-GIVEN a secret name containing characters outside `[a-zA-Z0-9._-]` (e.g. `../evil`)
-WHEN the name is used in any secrets endpoint
+The store's root directory itself SHALL never be removed by namespace cleanup, regardless of whether the configured secrets directory path carries a trailing path separator.
+
+#### Scenario: Namespaced secret round-trip
+GIVEN a name containing a `/` separator such as `ha/token`
+WHEN the value is stored then retrieved
+THEN the retrieved value equals the stored value
+
+#### Scenario: Deeply nested namespace
+GIVEN a name with multiple `/` separators such as `infra/db/password`
+WHEN the value is stored then retrieved
+THEN the retrieved value equals the stored value
+
+#### Scenario: List returns namespaced names
+GIVEN secrets `ha/token` and `ha/client-id` and `grafana/key` have been stored
+WHEN secrets are listed
+THEN all three namespaced names are returned
+
+#### Scenario: Invalid name with double slash rejected
+GIVEN a name containing `//` (empty segment)
+WHEN the name is used in a request
 THEN the server returns HTTP 400
 
-#### Scenario: Client rejects invalid name before encrypting
-GIVEN a secret name containing characters outside the allowed set
-WHEN `aged set` is run with that name
-THEN the client exits with a non-zero code and an error before making any network request
-AND no envelope is constructed and no request is sent to the server
+#### Scenario: Invalid name with `..` segment rejected
+GIVEN a name containing a `..` segment such as `foo/../bar`
+WHEN the name is used in a request
+THEN the server returns HTTP 400
 
-### Requirement: Environment Variable Configuration
+#### Scenario: Delete removes empty namespace directories
+GIVEN only one secret exists under a namespace (e.g. `ns/only`)
+WHEN the secret is deleted
+THEN the namespace directory is also removed
 
-The server SHALL read its runtime configuration from environment variables. When a config file is also present, environment variables take precedence over config file values. The following defaults apply when a value is absent from both sources. `identity`/`AGED_IDENTITY` is a client-only setting: it configures which identity file `get`, `set`, `pubkey`, and `rotate-identity` use, and `aged serve` SHALL NOT read or require it to start.
+#### Scenario: Name containing literal dots is accepted
+GIVEN a secret name such as `..foo` whose segment matches the allowed character class but is not exactly `..`
+WHEN the name is used in any secrets endpoint
+THEN the request is processed normally and is not rejected as a traversal attempt
 
-`token`/`AGED_TOKEN` is the CLI client's own credential and is read by every client command (`get`/`set`/`list`/`delete`) exactly as before. `aged serve` SHALL NOT treat a bare `token` value as an implicit tenant: server-side users come exclusively from the `[[users]]` config array and/or the `AGED_USERNAME`/`AGED_TOKEN` environment pair (see Multi-User Configuration). If `AGED_USERNAME` is set without `AGED_TOKEN`, or `AGED_TOKEN` is set without `AGED_USERNAME`, `aged serve` SHALL refuse to start with an error naming which of the two is missing.
+#### Scenario: Symlink escaping the store root is rejected
+GIVEN a symlink inside the secrets directory whose target resolves outside the store's own root
+WHEN the symlinked path is used in a get, set, or delete operation
+THEN the server rejects the operation
 
-| Variable | Config key | Default |
-|---|---|---|
-| `AGED_TOKEN` | `token` | — (client credential; combines with `AGED_USERNAME` to define one server user) |
-| `AGED_USERNAME` | — | — (server-only; combines with `AGED_TOKEN` to define one server user) |
-| `AGED_IDENTITY` | `identity` | `~/.config/aged/identity.age` (client-only) |
-| `AGED_SECRETS_DIR` | `secrets_dir` | `~/.config/aged/secrets/` |
-| `AGED_ADDR` | `addr` | `127.0.0.1:8743` |
-| `AGED_SERVER_URL` | `server_url` | `http://localhost:8743` |
-
-#### Scenario: Missing token on startup
-GIVEN no `[[users]]` entries are configured, and neither `AGED_TOKEN` nor `AGED_USERNAME` is set
-WHEN `aged serve` is run
-THEN the server exits with a non-zero code and an informative error message
-
-#### Scenario: Server starts without any identity configured
-GIVEN neither `AGED_IDENTITY` nor a config file `identity` key is set
-AND `AGED_TOKEN` and `AGED_USERNAME` are both set, defining one user
-WHEN `aged serve` is run
-THEN the server starts successfully
-
-#### Scenario: AGED_USERNAME without AGED_TOKEN refused
-GIVEN `AGED_USERNAME` is set and `AGED_TOKEN` is not set
-WHEN `aged serve` is run
-THEN the server exits with a non-zero code naming `AGED_TOKEN` as the missing value
-
-#### Scenario: AGED_TOKEN without AGED_USERNAME refused
-GIVEN `AGED_TOKEN` is set and `AGED_USERNAME` is not set
-WHEN `aged serve` is run
-THEN the server exits with a non-zero code naming `AGED_USERNAME` as the missing value
-
-### Requirement: Config File Loading
-
-The server SHALL load configuration from a TOML file before applying environment variable overrides. The file is optional — its absence is not an error. The lookup order is: (1) path in `$AGED_CONFIG`; (2) `/etc/aged/config.toml`; (3) `~/.config/aged/config.toml`. The first file found is used; remaining paths are not checked.
-
-If the located config file cannot be parsed, the server SHALL log a warning to stderr before continuing; environment variables may supply any missing values.
-
-#### Scenario: Config file sets identity path
-
-GIVEN a config file at the resolved path containing `identity = "/custom/path.age"`
-AND `AGED_IDENTITY` is not set in the environment
-WHEN the server starts
-THEN the identity file is read from `/custom/path.age`
-
-#### Scenario: Env var overrides config file
-
-GIVEN a config file containing `addr = "0.0.0.0:9000"`
-AND `AGED_ADDR` is set to `"127.0.0.1:8743"` in the environment
-WHEN the server starts
-THEN the server listens on `127.0.0.1:8743`
-
-#### Scenario: Absent config file is not an error
-
-GIVEN no config file exists at any of the lookup paths
-AND all required values are provided via environment variables
-WHEN the server starts
-THEN the server starts successfully
-
-#### Scenario: AGED_CONFIG points to a custom path
-
-GIVEN `$AGED_CONFIG` is set to `/tmp/my-aged.toml` containing a valid config
-WHEN the server starts
-THEN configuration is read from `/tmp/my-aged.toml` and the standard paths are not checked
-
-#### Scenario: Malformed config file logs a warning and continues
-
-GIVEN a config file exists at a standard lookup path
-AND the file contains invalid TOML
-WHEN aged starts or a client command runs
-THEN a warning is logged to stderr naming the file and the parse error
-AND execution continues (environment variables may supply missing values)
-
-### Requirement: Client Server URL Config
-
-The CLI client SHALL read the server URL from the `server_url` config file field when `AGED_SERVER_URL` is not set in the environment. Environment variables take precedence over the config file value. When neither source provides a value, the default `http://localhost:8743` is used.
-
-#### Scenario: Config file provides server URL
-GIVEN a config file containing `server_url = "https://aged.example.com"`
-AND `AGED_SERVER_URL` is not set in the environment
-WHEN a client command is run
-THEN requests are sent to `https://aged.example.com`
-
-#### Scenario: Env var overrides config file server URL
-GIVEN a config file containing `server_url = "https://aged.example.com"`
-AND `AGED_SERVER_URL` is set to `"http://localhost:8743"`
-WHEN a client command is run
-THEN requests are sent to `http://localhost:8743`
+#### Scenario: Store root survives cleanup regardless of trailing separator
+GIVEN the configured secrets directory path ends with a trailing path separator
+AND the last secret under a namespace is deleted
+WHEN the empty namespace directory is cleaned up
+THEN the store's own root directory is never removed
 
 ### Requirement: Token Rotation
 
@@ -374,204 +280,6 @@ WHEN `aged rotate-token` is run targeting the other user
 THEN the rotation succeeds
 AND a warning naming the malformed user is printed
 
-### Requirement: Namespaced Secret Names
-
-Secret names SHALL support `/` as a namespace separator. Each segment between `/` characters SHALL match `[a-zA-Z0-9._-]+`. Names with empty segments, leading or trailing slashes, or any segment equal to `..` SHALL be rejected with HTTP 400. The store SHALL persist namespaced secrets as a subdirectory tree (e.g. `ha/token` → `ha/token.age` under the secrets directory).
-
-The resolved file path SHALL be verified to lie within the secrets directory before any file operation, using the precise form of the containment check (`rel == ".."`, or `rel` begins with `".."` followed by the path separator) so that a legitimate name containing literal dots (e.g. `..foo`, a valid segment under the character class above) is never rejected. This verification SHALL additionally resolve symlinks: for an operation on an existing file, the resolved (symlink-free) path SHALL be re-verified to lie within the store's own symlink-resolved root; for a new file being created, the resolved (symlink-free) parent directory SHALL be re-verified instead. A symlink whose resolved target lies outside the store's root SHALL be rejected on every operation (get, set, delete).
-
-The store's root directory itself SHALL never be removed by namespace cleanup, regardless of whether the configured secrets directory path carries a trailing path separator.
-
-#### Scenario: Namespaced secret round-trip
-GIVEN a name containing a `/` separator such as `ha/token`
-WHEN the value is stored then retrieved
-THEN the retrieved value equals the stored value
-
-#### Scenario: Deeply nested namespace
-GIVEN a name with multiple `/` separators such as `infra/db/password`
-WHEN the value is stored then retrieved
-THEN the retrieved value equals the stored value
-
-#### Scenario: List returns namespaced names
-GIVEN secrets `ha/token` and `ha/client-id` and `grafana/key` have been stored
-WHEN secrets are listed
-THEN all three namespaced names are returned
-
-#### Scenario: Invalid name with double slash rejected
-GIVEN a name containing `//` (empty segment)
-WHEN the name is used in a request
-THEN the server returns HTTP 400
-
-#### Scenario: Invalid name with `..` segment rejected
-GIVEN a name containing a `..` segment such as `foo/../bar`
-WHEN the name is used in a request
-THEN the server returns HTTP 400
-
-#### Scenario: Delete removes empty namespace directories
-GIVEN only one secret exists under a namespace (e.g. `ns/only`)
-WHEN the secret is deleted
-THEN the namespace directory is also removed
-
-#### Scenario: Name containing literal dots is accepted
-GIVEN a secret name such as `..foo` whose segment matches the allowed character class but is not exactly `..`
-WHEN the name is used in any secrets endpoint
-THEN the request is processed normally and is not rejected as a traversal attempt
-
-#### Scenario: Symlink escaping the store root is rejected
-GIVEN a symlink inside the secrets directory whose target resolves outside the store's own root
-WHEN the symlinked path is used in a get, set, or delete operation
-THEN the server rejects the operation
-
-#### Scenario: Store root survives cleanup regardless of trailing separator
-GIVEN the configured secrets directory path ends with a trailing path separator
-AND the last secret under a namespace is deleted
-WHEN the empty namespace directory is cleaned up
-THEN the store's own root directory is never removed
-
-### Requirement: HTTP Server Configuration
-
-The server SHALL be configured with explicit per-connection timeouts to prevent goroutine exhaustion from slow or stalled clients. The following minimum timeouts SHALL be set:
-
-| Timeout | Minimum value |
-|---|---|
-| `ReadHeaderTimeout` | 5 seconds |
-| `ReadTimeout` | 10 seconds |
-| `WriteTimeout` | 30 seconds |
-| `IdleTimeout` | 60 seconds |
-
-#### Scenario: Server is configured with non-zero timeouts
-
-GIVEN the server is started
-WHEN the HTTP server is initialised
-THEN `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, and `IdleTimeout` are all set to non-zero values meeting or exceeding the minimums above
-
-### Requirement: Client-Side Secret Encryption
-
-The CLI client SHALL encrypt a secret value locally, using the identity configured for the invoking machine, before any network transmission to the server. The server SHALL at no point receive, construct, or observe the plaintext value.
-
-The client SHALL: read the plaintext from stdin; strip exactly one trailing newline; validate the secret name (see Secret Name Validation); construct a name-binding envelope (see Name-Binding Integrity Check) from the trimmed plaintext and the validated name; encrypt the envelope to the local identity's own recipient using the age v1 format; and upload the resulting ciphertext bytes verbatim.
-
-#### Scenario: Set encrypts before upload
-GIVEN a plaintext value on stdin and a valid secret name
-WHEN `aged set <name>` is run
-THEN the value is encrypted locally to the caller's own identity before any request is sent
-AND the server receives only ciphertext bytes
-
-#### Scenario: Trailing newline stripped exactly once
-GIVEN a plaintext value on stdin ending in a newline
-WHEN `aged set <name>` is run
-THEN exactly one trailing newline is stripped before encryption
-AND no further trimming is applied anywhere else in the system
-
-### Requirement: Client-Side Secret Decryption
-
-The CLI client SHALL download the stored ciphertext for a named secret and decrypt it locally, trying every identity present in the configured identity file in order, before printing the plaintext value. The server SHALL at no point perform or assist with decryption.
-
-#### Scenario: Get decrypts locally
-GIVEN a secret previously stored via `aged set`
-WHEN `aged get <name>` is run from a machine holding the matching identity
-THEN the ciphertext is downloaded and decrypted locally
-AND the plaintext value is printed to stdout with no trailing newline
-
-#### Scenario: Multiple identities tried in order
-GIVEN an identity file containing more than one identity
-WHEN `aged get <name>` is run and the secret was encrypted to any one of them
-THEN decryption succeeds using whichever identity matches
-AND the client does not require the matching identity to be first in the file
-
-#### Scenario: No identity matches
-GIVEN a secret encrypted to a recipient not present in the caller's identity file
-WHEN `aged get <name>` is run
-THEN the client returns an error indicating the secret was not encrypted to any of the caller's identities
-AND the error suggests this means the wrong machine or a rotated key
-AND no partial or garbage value is printed
-
-#### Scenario: Missing local identity
-GIVEN no identity file exists at the configured path
-WHEN `aged get <name>` or `aged set <name>` is run
-THEN the client returns an error naming the expected path and instructing the caller to run `aged init`
-
-### Requirement: Name-Binding Integrity Check
-
-The plaintext handed to client-side encryption SHALL be wrapped in an envelope binding it to its secret name, so that a ciphertext file moved, renamed, or swapped with another on disk is detected and rejected on retrieval rather than silently returned under the wrong name.
-
-The envelope format SHALL be exactly: the literal bytes `aged-v1\nname: `, followed by the secret name, followed by the literal bytes `\n\n`, followed by the value bytes verbatim to the end of the plaintext. No escaping of the name is performed or required, because valid secret names cannot contain `\n` (see Secret Name Validation).
-
-On decryption, the client SHALL: verify the plaintext begins with the exact literal `aged-v1\nname: `; read up to the next `\n` as the bound name; verify the following byte is `\n`; and verify the bound name equals the name that was requested. A missing, malformed, or mismatched envelope SHALL be a hard failure — the value SHALL NOT be returned, printed, or logged under any circumstance, regardless of whether decryption itself otherwise succeeded.
-
-#### Scenario: Matching name round-trips
-GIVEN a secret stored under name `ha/token`
-WHEN it is retrieved by the same name
-THEN the envelope's bound name matches the requested name
-AND the value is returned
-
-#### Scenario: Swapped ciphertext files are detected
-GIVEN two secrets `a` and `b` whose stored ciphertext files are swapped on disk (e.g. via direct filesystem manipulation)
-WHEN either `a` or `b` is retrieved
-THEN the decrypted envelope's bound name does not match the requested name
-AND the client returns an error instead of returning the wrong value
-
-#### Scenario: Malformed envelope rejected
-GIVEN a ciphertext that decrypts to plaintext not matching the envelope grammar
-WHEN it is retrieved
-THEN the client returns an error
-AND no value is printed
-
-### Requirement: Ciphertext Format Validation
-
-The server SHALL validate that uploaded content begins with the literal age v1 file format magic bytes `age-encryption.org/v1\n` before storing it, without attempting to decrypt or otherwise parse the content further. Content that does not begin with this magic SHALL be rejected with HTTP 400 and a generic error body that does not disclose library implementation details.
-
-#### Scenario: Valid age-formatted upload accepted
-GIVEN content beginning with the age v1 magic bytes
-WHEN it is uploaded via `POST /secrets/{name}`
-THEN the server accepts and stores it
-
-#### Scenario: Non-age content rejected
-GIVEN content that does not begin with the age v1 magic bytes (e.g. plaintext from a pre-change client)
-WHEN it is uploaded via `POST /secrets/{name}`
-THEN the server returns HTTP 400
-AND the response body does not include any age library error text
-
-### Requirement: Upload Size Limit
-
-The server SHALL enforce a maximum upload size of 96 KiB on `POST /secrets/{name}` by rejecting any request body exceeding the limit with HTTP 413, rather than silently truncating it.
-
-#### Scenario: Oversized upload rejected, not truncated
-GIVEN a request body larger than 96 KiB
-WHEN it is uploaded via `POST /secrets/{name}`
-THEN the server returns HTTP 413
-AND no truncated or partial content is stored
-
-### Requirement: Local Public Key Command
-
-The `aged pubkey` command SHALL read the identity file configured for the invoking machine and print the recipient (public key) of every identity found in it, one per line, without making any network request to the server.
-
-#### Scenario: Prints local recipient
-GIVEN a local identity file containing one identity
-WHEN `aged pubkey` is run
-THEN the identity's `age1…` recipient is printed to stdout
-AND no request is made to the server
-
-#### Scenario: Prints every recipient during rotation overlap
-GIVEN a local identity file containing more than one identity
-WHEN `aged pubkey` is run
-THEN one recipient is printed per line, in file order
-
-### Requirement: Stale Server Identity Warning
-
-`aged serve` SHALL log a clear warning at startup if `identity`/`AGED_IDENTITY` is explicitly set in the environment or in the located config file, naming the configured path and explaining that the server no longer uses it and that it should be secured or removed once migration to client-side encryption has been verified. The warning SHALL NOT fire merely because a file happens to exist at the default identity path, since that path is the correct default location for a client-only identity on a combined server-and-client host.
-
-#### Scenario: Warning fires when identity is explicitly configured
-GIVEN `AGED_IDENTITY` is set in the environment, or the located config file sets `identity`
-WHEN `aged serve` starts
-THEN a warning is logged naming the configured path
-
-#### Scenario: No warning when identity is left at its default
-GIVEN neither `AGED_IDENTITY` nor a config file `identity` key is set
-AND a file happens to exist at the default identity path
-WHEN `aged serve` starts
-THEN no stale-identity warning is logged
-
 ### Requirement: Identity Rotation
 
 The system SHALL provide an `aged rotate-identity <new-identity-file>` command that re-encrypts every secret in the configured secrets directory from the currently configured identity to a new identity, as a single operation that either succeeds completely or leaves the existing secrets directory completely untouched.
@@ -649,6 +357,8 @@ GIVEN more than one user is configured, each with their own secrets
 WHEN `aged rotate-identity <new-identity-file> --user <name>` is run for one of them
 THEN only that user's secrets are re-encrypted
 AND the other users' secrets are unaffected
+
+## ADDED Requirements
 
 ### Requirement: Multi-User Configuration
 

@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"filippo.io/age"
@@ -26,12 +28,53 @@ type rotateSummary struct {
 	failed   int
 }
 
-// rotateIdentity re-encrypts every secret in the configured secrets
-// directory from the currently configured identity to the identity in
+// selectRotateIdentityTarget resolves which configured user rotate-identity
+// should operate on, using the same required-when-ambiguous policy as
+// rotate-token's target selection (see design.md D6.1). Refusing when
+// ambiguous is essential: without it, an omitted --user would resolve the
+// shared, multi-tenant secrets base directly and attempt to re-encrypt every
+// tenant's secrets to one identity in a single fleet-wide operation.
+func selectRotateIdentityTarget(users []UserConfig, username string) (string, error) {
+	names := make([]string, len(users))
+	for i, u := range users {
+		names[i] = u.Name
+	}
+	sorted := append([]string{}, names...)
+	sort.Strings(sorted)
+
+	if username == "" {
+		switch len(names) {
+		case 0:
+			return "", errors.New("no users are configured; check the config file or AGED_USERNAME/AGED_TOKEN")
+		case 1:
+			return names[0], nil
+		default:
+			return "", fmt.Errorf(
+				"more than one user is configured; specify --user <name> (configured users: %s)",
+				strings.Join(sorted, ", "),
+			)
+		}
+	}
+	for _, n := range names {
+		if n == username {
+			return username, nil
+		}
+	}
+	return "", fmt.Errorf("no configured user named %q (configured users: %s)", username, strings.Join(sorted, ", "))
+}
+
+// rotateIdentity re-encrypts every secret in one configured user's own
+// secrets subtree from the currently configured identity to the identity in
 // newIdentityPath, per design.md D7-D9: it either succeeds completely,
-// leaving secretsDir replaced and the previous contents kept as a
-// timestamped backup, or aborts leaving secretsDir completely untouched.
-func rotateIdentity(newIdentityPath string, dryRun bool, out io.Writer) error {
+// leaving that subtree replaced and its previous contents kept as a
+// timestamped backup, or aborts leaving the subtree completely untouched.
+//
+// username selects which user's subtree to operate on: required when more
+// than one user is configured, auto-selected (and always printed) when
+// exactly one is (see design.md D6.1). The command only ever touches
+// secrets_dir/<name>/ — the shared multi-tenant base directory itself is
+// never re-encrypted as a whole.
+func rotateIdentity(newIdentityPath string, username string, dryRun bool, out io.Writer) error {
 	cfg := loadConfig()
 
 	if !dryRun {
@@ -39,6 +82,32 @@ func rotateIdentity(newIdentityPath string, dryRun bool, out io.Writer) error {
 			return err
 		}
 	}
+
+	users, _, err := resolveUsers(cfg)
+	if err != nil {
+		return err
+	}
+	selectedUser, err := selectRotateIdentityTarget(users, username)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "operating on user %q\n", selectedUser)
+
+	// Surface (without blocking on) a validation problem on a user OTHER
+	// than the one being operated on — mirroring rotate-token's D5.3
+	// policy — so the operator gets the same signal aged serve's own
+	// startup validation would give, without being blocked from operating
+	// on a target user whose own configuration is fine.
+	for i, u := range users {
+		if u.Name == selectedUser {
+			continue
+		}
+		for _, p := range validateUserSet([]UserConfig{users[i]}) {
+			fmt.Fprintf(out, "warning: %s\n", p.message)
+		}
+	}
+
+	effectiveRoot := filepath.Join(cfg.SecretsDir, selectedUser)
 
 	oldIdentities, err := loadIdentities(cfg.Identity)
 	if err != nil {
@@ -50,7 +119,7 @@ func rotateIdentity(newIdentityPath string, dryRun bool, out io.Writer) error {
 		return err
 	}
 
-	store, err := newStore(cfg.SecretsDir)
+	store, err := newStore(effectiveRoot)
 	if err != nil {
 		return fmt.Errorf("open secrets store: %w", err)
 	}
@@ -66,7 +135,7 @@ func rotateIdentity(newIdentityPath string, dryRun bool, out io.Writer) error {
 		return err
 	}
 
-	return performRotate(cfg.SecretsDir, store, names, oldIdentities, newIdentity, out)
+	return performRotate(effectiveRoot, store, names, oldIdentities, newIdentity, out)
 }
 
 // refuseIfServerRunning refuses to proceed if addr appears to already be

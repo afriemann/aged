@@ -11,15 +11,24 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// UserConfig identifies one server-side user (tenant): a name used to select
+// their storage subdirectory, and the bearer token that authenticates as
+// them.
+type UserConfig struct {
+	Name  string `toml:"name"`
+	Token string `toml:"token"`
+}
+
 // Config holds all server and client runtime configuration. Fields are
 // populated by loadConfig: config file values are applied first, then env var
 // values override them.
 type Config struct {
-	Token      string `toml:"token"`
-	Identity   string `toml:"identity"`
-	SecretsDir string `toml:"secrets_dir"`
-	Addr       string `toml:"addr"`
-	ServerURL  string `toml:"server_url"`
+	Token      string       `toml:"token"`
+	Identity   string       `toml:"identity"`
+	SecretsDir string       `toml:"secrets_dir"`
+	Addr       string       `toml:"addr"`
+	ServerURL  string       `toml:"server_url"`
+	Users      []UserConfig `toml:"users"`
 
 	// identityExplicit records whether Identity was set by the config file
 	// or an environment variable, as opposed to being left empty and later
@@ -27,6 +36,16 @@ type Config struct {
 	// Used solely to gate the stale-identity startup warning in serve() —
 	// see warnIfIdentityConfigured in server.go.
 	identityExplicit bool
+
+	// envToken and envUsername capture the raw AGED_TOKEN/AGED_USERNAME
+	// values verbatim, independent of cfg.Token (which remains the
+	// client's own credential). Server startup (resolveUsers, in
+	// server.go) decides whether and how to merge this pair into the
+	// configured user set; loadConfig itself performs no such merge so
+	// that client commands (get/set/list/delete), which only ever read
+	// cfg.Token, are completely unaffected by AGED_USERNAME.
+	envToken    string
+	envUsername string
 }
 
 // loadConfig returns the effective server configuration. It searches for a
@@ -64,6 +83,9 @@ func loadConfig() Config {
 	if v := os.Getenv("AGED_SERVER_URL"); v != "" {
 		cfg.ServerURL = v
 	}
+
+	cfg.envToken = os.Getenv("AGED_TOKEN")
+	cfg.envUsername = os.Getenv("AGED_USERNAME")
 
 	// identityExplicit must be captured now, before the default path below
 	// is applied — it is the sole trigger for the stale-identity warning in

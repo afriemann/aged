@@ -22,29 +22,44 @@ import (
 
 const testToken = "test-bearer-token"
 
-// testServer creates an httptest.Server backed by a fresh store. The server
+// singleTenant returns a one-tenant slice for tests that only need a single
+// authenticated caller and don't care about routing between multiple users.
+func singleTenant(name, token string, store *Store) []tenant {
+	return []tenant{{name: name, token: token, store: store}}
+}
+
+// testServer creates an httptest.Server backed by a fresh store, wired as a
+// single tenant named "testuser" authenticating with testToken. The server
 // and its temp directory are cleaned up automatically by t.Cleanup.
 func testServer(t *testing.T) (*httptest.Server, *Store) {
 	t.Helper()
 	store := testStore(t)
-	auth := bearerMiddleware(testToken, io.Discard)
+	return newTestServer(t, singleTenant("testuser", testToken, store)), store
+}
+
+// newTestServer builds an httptest.Server multiplexing the given tenants,
+// exactly as serve() wires the real mux. Used directly by tests that need
+// more than one tenant.
+func newTestServer(t *testing.T, tenants []tenant) *httptest.Server {
+	t.Helper()
+	auth := bearerMiddleware(tenants, io.Discard)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /secrets", auth(func(w http.ResponseWriter, _ *http.Request) {
-		names, _ := store.listNames()
+	mux.HandleFunc("GET /secrets", auth(func(w http.ResponseWriter, _ *http.Request, tn *tenant) {
+		names, _ := tn.store.listNames()
 		if names == nil {
 			names = []string{}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(names)
 	}))
-	mux.HandleFunc("GET /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request, tn *tenant) {
 		name := r.PathValue("name")
 		if !validName(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
 			return
 		}
-		val, err := store.getValue(name)
+		val, err := tn.store.getValue(name)
 		if err != nil {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -52,7 +67,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(val)
 	}))
-	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request, tn *tenant) {
 		name := r.PathValue("name")
 		if !validName(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
@@ -69,7 +84,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if err := store.setValue(name, body); err != nil {
+		if err := tn.store.setValue(name, body); err != nil {
 			if errors.Is(err, errInvalidFormat) {
 				http.Error(w, "invalid secret format", http.StatusBadRequest)
 				return
@@ -79,13 +94,13 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	mux.HandleFunc("DELETE /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("DELETE /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request, tn *tenant) {
 		name := r.PathValue("name")
 		if !validName(name) {
 			http.Error(w, "invalid name", http.StatusBadRequest)
 			return
 		}
-		if err := store.removeValue(name); err != nil {
+		if err := tn.store.removeValue(name); err != nil {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
@@ -94,7 +109,7 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return srv, store
+	return srv
 }
 
 // do performs an authenticated request against the test server.
@@ -370,10 +385,10 @@ func TestInitIdentity_RefusesToOverwriteExisting(t *testing.T) {
 // authMiddlewareWith returns a bearerMiddleware handler wired to the given
 // log writer. It registers a single GET /secrets route so tests have a
 // real endpoint to hit.
-func authMiddlewareWith(t *testing.T, logDst io.Writer, token, reqToken, remoteAddr, xRealIP, method, path string) *httptest.ResponseRecorder {
+func authMiddlewareWith(t *testing.T, logDst io.Writer, tenants []tenant, reqToken, remoteAddr, xRealIP, method, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	auth := bearerMiddleware(token, logDst)
-	handler := auth(func(w http.ResponseWriter, _ *http.Request) {
+	auth := bearerMiddleware(tenants, logDst)
+	handler := auth(func(w http.ResponseWriter, _ *http.Request, _ *tenant) {
 		w.WriteHeader(http.StatusOK)
 	})
 	req := httptest.NewRequest(method, path, nil)
@@ -392,7 +407,7 @@ func authMiddlewareWith(t *testing.T, logDst io.Writer, token, reqToken, remoteA
 func TestBearerMiddleware_AuthFailureLoggedWithRealClientIP(t *testing.T) {
 	// spec: HTTP Authentication — Auth failure logged with real client IP
 	var buf bytes.Buffer
-	authMiddlewareWith(t, &buf, testToken, "wrong", "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
+	authMiddlewareWith(t, &buf, singleTenant("testuser", testToken, nil), "wrong", "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
 	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 1.2.3.4") {
 		t.Errorf("log %q: want auth failure line with real IP 1.2.3.4", buf.String())
 	}
@@ -401,7 +416,7 @@ func TestBearerMiddleware_AuthFailureLoggedWithRealClientIP(t *testing.T) {
 func TestBearerMiddleware_AuthSuccessLoggedWithRealClientIP(t *testing.T) {
 	// spec: HTTP Authentication — Auth success logged with real client IP
 	var buf bytes.Buffer
-	authMiddlewareWith(t, &buf, testToken, testToken, "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
+	authMiddlewareWith(t, &buf, singleTenant("testuser", testToken, nil), testToken, "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
 	if !strings.Contains(buf.String(), "auth ok: GET /secrets from 1.2.3.4") {
 		t.Errorf("log %q: want auth ok line with real IP 1.2.3.4", buf.String())
 	}
@@ -410,7 +425,7 @@ func TestBearerMiddleware_AuthSuccessLoggedWithRealClientIP(t *testing.T) {
 func TestBearerMiddleware_AuthFailureLoggedWithLoopbackWhenXRealIPAbsent(t *testing.T) {
 	// spec: HTTP Authentication — Auth failure logged with loopback IP when X-Real-IP absent
 	var buf bytes.Buffer
-	authMiddlewareWith(t, &buf, testToken, "wrong", "127.0.0.1:12345", "" /* no X-Real-IP */, http.MethodGet, "/secrets")
+	authMiddlewareWith(t, &buf, singleTenant("testuser", testToken, nil), "wrong", "127.0.0.1:12345", "" /* no X-Real-IP */, http.MethodGet, "/secrets")
 	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 127.0.0.1") {
 		t.Errorf("log %q: want auth failure line with loopback IP", buf.String())
 	}
@@ -420,7 +435,7 @@ func TestBearerMiddleware_AuthFailureLoggedWithDirectPeerIPWhenNotBehindProxy(t 
 	// spec: HTTP Authentication — Auth failure logged with direct peer IP when not behind proxy
 	var buf bytes.Buffer
 	// Non-loopback peer; X-Real-IP must be ignored.
-	authMiddlewareWith(t, &buf, testToken, "wrong", "10.0.0.5:54321", "1.2.3.4" /* must be ignored */, http.MethodGet, "/secrets")
+	authMiddlewareWith(t, &buf, singleTenant("testuser", testToken, nil), "wrong", "10.0.0.5:54321", "1.2.3.4" /* must be ignored */, http.MethodGet, "/secrets")
 	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 10.0.0.5") {
 		t.Errorf("log %q: want auth failure line with peer IP 10.0.0.5 (not X-Real-IP)", buf.String())
 	}
@@ -430,7 +445,7 @@ func TestBearerMiddleware_AuthFailureLoggedWithIPv6RealClientIP(t *testing.T) {
 	// spec: HTTP Authentication — Auth failure logged with real client IP
 	// Exercises the ::1 loopback branch.
 	var buf bytes.Buffer
-	authMiddlewareWith(t, &buf, testToken, "wrong", "[::1]:12345", "2001:db8::1", http.MethodGet, "/secrets")
+	authMiddlewareWith(t, &buf, singleTenant("testuser", testToken, nil), "wrong", "[::1]:12345", "2001:db8::1", http.MethodGet, "/secrets")
 	if !strings.Contains(buf.String(), "auth failure: GET /secrets from 2001:db8::1") {
 		t.Errorf("log %q: want auth failure line with IPv6 real IP 2001:db8::1", buf.String())
 	}
@@ -448,8 +463,8 @@ func TestBearerMiddleware_CRLFInPathDoesNotForgeSecondLogLine(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			auth := bearerMiddleware(testToken, &buf)
-			handler := auth(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+			auth := bearerMiddleware(singleTenant("testuser", testToken, nil), &buf)
+			handler := auth(func(w http.ResponseWriter, _ *http.Request, _ *tenant) { w.WriteHeader(http.StatusOK) })
 			req := httptest.NewRequest(http.MethodGet, "/secrets/foo", nil)
 			req.RemoteAddr = "127.0.0.1:12345"
 			req.Header.Set("X-Real-IP", "1.2.3.4")
@@ -488,7 +503,11 @@ func TestBearerMiddleware_CRLFInPathDoesNotForgeSecondLogLine(t *testing.T) {
 
 func TestMain_NoArgsCommandsRejectExtraArgs(t *testing.T) {
 	// spec: base — no-argument subcommands reject unexpected arguments
-	for _, cmd := range []string{"list", "pubkey", "init", "rotate-token"} {
+	// rotate-token is deliberately excluded: it now accepts an optional
+	// <username> argument (required when more than one user is configured),
+	// so it must not reject a trailing argument the way true no-argument
+	// commands do.
+	for _, cmd := range []string{"list", "pubkey", "init"} {
 		t.Run(cmd, func(t *testing.T) {
 			// noArgs reads os.Args directly; we verify the guard logic
 			// by checking that len(os.Args) > 2 triggers it.
@@ -537,8 +556,8 @@ func TestResolveClientIP_IPv4MappedLoopback(t *testing.T) {
 func TestBearerMiddleware_WWWAuthenticateHeaderOnFailure(t *testing.T) {
 	// spec: HTTP Authentication — WWW-Authenticate header present on 401
 	var buf bytes.Buffer
-	auth := bearerMiddleware(testToken, &buf)
-	handler := auth(func(w http.ResponseWriter, _ *http.Request) {})
+	auth := bearerMiddleware(singleTenant("testuser", testToken, nil), &buf)
+	handler := auth(func(w http.ResponseWriter, _ *http.Request, _ *tenant) {})
 	req := httptest.NewRequest(http.MethodGet, "/secrets", nil)
 	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("Authorization", "Bearer wrong-token")
@@ -603,13 +622,18 @@ func TestServeStaleIdentityWarning(t *testing.T) {
 func TestServe_StartsWithoutAnyIdentityConfigured(t *testing.T) {
 	// spec: Environment Variable Configuration — Server starts without any identity configured
 	t.Setenv("AGED_CONFIG", "/tmp/definitely-absent-aged-test.toml")
-	t.Setenv("AGED_TOKEN", "env-token")
+	t.Setenv("AGED_TOKEN", tok('a'))
+	t.Setenv("AGED_USERNAME", "laptop")
 	t.Setenv("AGED_IDENTITY", "")
 	t.Setenv("AGED_SECRETS_DIR", t.TempDir())
 
 	cfg := loadConfig()
-	if cfg.Token == "" {
-		t.Fatal("precondition failed: token must be set")
+	users, problems, err := resolveUsers(cfg)
+	if err != nil || len(problems) != 0 {
+		t.Fatalf("precondition failed: resolveUsers returned problems=%v err=%v", problems, err)
+	}
+	if len(users) != 1 || users[0].Name != "laptop" {
+		t.Fatalf("precondition failed: want a single laptop user, got %+v", users)
 	}
 
 	// This mirrors exactly what serve() does with cfg before starting the
@@ -629,39 +653,230 @@ func TestServe_StartsWithoutAnyIdentityConfigured(t *testing.T) {
 
 func TestCheckServeConfig_MissingTokenOnStartup(t *testing.T) {
 	// spec: Environment Variable Configuration — Missing token on startup
-	err := checkServeConfig(Config{Token: ""})
+	// (renamed: with no [[users]] and no AGED_USERNAME/AGED_TOKEN pair, the
+	// server now refuses to start because no user is configured at all —
+	// Config.Token alone no longer defines a server-side tenant.)
+	err := checkServeConfig(Config{})
 	if err == nil {
-		t.Fatal("expected an error when token is empty, got nil")
+		t.Fatal("expected an error when no users are configured, got nil")
 	}
 }
 
-func TestCheckServeConfig_TokenPresent(t *testing.T) {
-	// spec: Environment Variable Configuration — Server starts without any identity configured
-	err := checkServeConfig(Config{Token: "some-token"})
+func TestCheckServeConfig_UsersConfigured(t *testing.T) {
+	// spec: Multi-User Configuration — Single user via config file
+	err := checkServeConfig(Config{Users: []UserConfig{{Name: "alice", Token: tok('a')}}})
 	if err != nil {
-		t.Errorf("expected no error when token is set, got %v", err)
+		t.Errorf("expected no error when a valid user is configured, got %v", err)
+	}
+}
+
+func TestCheckServeConfig_BareTokenAloneIsNoLongerAServerCredential(t *testing.T) {
+	// spec: Environment Variable Configuration — token/AGED_TOKEN is the CLI
+	// client's own credential; aged serve SHALL NOT treat a bare token
+	// value as an implicit tenant.
+	err := checkServeConfig(Config{Token: "some-token"})
+	if err == nil {
+		t.Fatal("expected an error: Config.Token alone must not define a server user")
 	}
 }
 
 func TestParseRotateIdentityArgs(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		args       []string
-		wantFile   string
-		wantDryRun bool
+		name         string
+		args         []string
+		wantFile     string
+		wantDryRun   bool
+		wantUsername string
+		wantErr      bool
 	}{
-		{"flag before path", []string{"--dry-run", "file.age"}, "file.age", true},
-		{"flag after path", []string{"file.age", "--dry-run"}, "file.age", true},
-		{"no flag", []string{"file.age"}, "file.age", false},
-		{"multiple positional args: last wins", []string{"a.age", "b.age"}, "b.age", false},
-		{"no args", []string{}, "", false},
+		{"flag before path", []string{"--dry-run", "file.age"}, "file.age", true, "", false},
+		{"flag after path", []string{"file.age", "--dry-run"}, "file.age", true, "", false},
+		{"no flag", []string{"file.age"}, "file.age", false, "", false},
+		{"multiple positional args: last wins", []string{"a.age", "b.age"}, "b.age", false, "", false},
+		{"no args", []string{}, "", false, "", false},
+		{"--user before path", []string{"--user", "alice", "file.age"}, "file.age", false, "alice", false},
+		{"--user after path", []string{"file.age", "--user", "alice"}, "file.age", false, "alice", false},
+		{"--user combined with --dry-run", []string{"--dry-run", "--user", "alice", "file.age"}, "file.age", true, "alice", false},
+		{"--user with no following value", []string{"file.age", "--user"}, "", false, "", true},
+		{"--user immediately followed by another flag", []string{"file.age", "--user", "--dry-run"}, "", false, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gotFile, gotDryRun := parseRotateIdentityArgs(tc.args)
-			if gotFile != tc.wantFile || gotDryRun != tc.wantDryRun {
-				t.Errorf("parseRotateIdentityArgs(%v) = (%q, %v), want (%q, %v)",
-					tc.args, gotFile, gotDryRun, tc.wantFile, tc.wantDryRun)
+			gotFile, gotDryRun, gotUsername, err := parseRotateIdentityArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseRotateIdentityArgs(%v): expected an error, got nil", tc.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseRotateIdentityArgs(%v): unexpected error: %v", tc.args, err)
+			}
+			if gotFile != tc.wantFile || gotDryRun != tc.wantDryRun || gotUsername != tc.wantUsername {
+				t.Errorf("parseRotateIdentityArgs(%v) = (%q, %v, %q), want (%q, %v, %q)",
+					tc.args, gotFile, gotDryRun, gotUsername, tc.wantFile, tc.wantDryRun, tc.wantUsername)
 			}
 		})
+	}
+}
+
+func TestServer_SecondConfiguredUsersTokenAuthenticates(t *testing.T) {
+	// spec: HTTP Authentication — Second configured user's token authenticates
+	aliceStore := testStore(t)
+	bobStore := testStore(t)
+	tenants := []tenant{
+		{name: "alice", token: tok('a'), store: aliceStore},
+		{name: "bob", token: tok('b'), store: bobStore},
+	}
+	srv := newTestServer(t, tenants)
+
+	resp := do(t, srv, http.MethodGet, "/secrets", tok('b'), nil)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Errorf("last configured user's token was rejected, want accepted")
+	}
+}
+
+func TestServer_OneUserCannotListAnotherUsersSecrets(t *testing.T) {
+	// spec: Per-User Storage Isolation — One user cannot list another user's secrets
+	aliceStore := testStore(t)
+	bobStore := testStore(t)
+	if err := aliceStore.setValue("alice-only", testCiphertext(t, "a")); err != nil {
+		t.Fatalf("setValue: %v", err)
+	}
+	if err := bobStore.setValue("bob-only", testCiphertext(t, "b")); err != nil {
+		t.Fatalf("setValue: %v", err)
+	}
+	tenants := []tenant{
+		{name: "alice", token: tok('a'), store: aliceStore},
+		{name: "bob", token: tok('b'), store: bobStore},
+	}
+	srv := newTestServer(t, tenants)
+
+	resp := do(t, srv, http.MethodGet, "/secrets", tok('a'), nil)
+	defer resp.Body.Close()
+	var names []string
+	json.NewDecoder(resp.Body).Decode(&names)
+	if len(names) != 1 || names[0] != "alice-only" {
+		t.Errorf("got %v, want exactly [alice-only]", names)
+	}
+}
+
+func TestBearerMiddleware_EveryTenantComparedRegardlessOfMatchPosition(t *testing.T) {
+	// spec: HTTP Authentication — constant-time comparison with no early exit
+	//
+	// This is a structural assertion, not a wall-clock timing measurement
+	// (per design.md D3.1: "Assert this structurally... Wall-clock timing
+	// tests are flaky and prove nothing on a shared CI runner"). It proves
+	// the loop has no early exit by instrumenting every
+	// subtle.ConstantTimeCompare call via bearerMiddlewareCompareHook and
+	// asserting the count equals len(tenants) regardless of which
+	// position — first, middle, last, or none — matches.
+	tenants := make([]tenant, 5)
+	for i := range tenants {
+		tenants[i] = tenant{name: fmt.Sprintf("user%d", i), token: tok(byte('a' + i))}
+	}
+	auth := bearerMiddleware(tenants, io.Discard)
+	handler := auth(func(w http.ResponseWriter, _ *http.Request, _ *tenant) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	run := func(t *testing.T, presentedToken string) int {
+		t.Helper()
+		count := 0
+		bearerMiddlewareCompareHook = func() { count++ }
+		t.Cleanup(func() { bearerMiddlewareCompareHook = nil })
+
+		req := httptest.NewRequest(http.MethodGet, "/secrets", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		if presentedToken != "" {
+			req.Header.Set("Authorization", "Bearer "+presentedToken)
+		}
+		rr := httptest.NewRecorder()
+		handler(rr, req)
+		return count
+	}
+
+	for _, matchIdx := range []int{0, 2, len(tenants) - 1} {
+		t.Run(fmt.Sprintf("match at index %d", matchIdx), func(t *testing.T) {
+			count := run(t, tenants[matchIdx].token)
+			if count != len(tenants) {
+				t.Errorf("compared %d tenant(s), want exactly %d (every tenant, no early exit)", count, len(tenants))
+			}
+		})
+	}
+
+	t.Run("no match", func(t *testing.T) {
+		count := run(t, "wrong-token-entirely")
+		if count != len(tenants) {
+			t.Errorf("compared %d tenant(s), want exactly %d even when nothing matches", count, len(tenants))
+		}
+	})
+}
+
+func TestServer_SecondConfiguredUsersTokenAuthenticates_RoutesToCorrectTenant(t *testing.T) {
+	// spec: HTTP Authentication — Second configured user's token authenticates
+	// (routing correctness, complementing the structural no-early-exit test
+	// above)
+	var compared []string
+	tenants := make([]tenant, 5)
+	for i := range tenants {
+		tenants[i] = tenant{name: fmt.Sprintf("user%d", i), token: tok(byte('a' + i))}
+	}
+	auth := bearerMiddleware(tenants, io.Discard)
+	handler := auth(func(w http.ResponseWriter, _ *http.Request, tn *tenant) {
+		compared = append(compared, tn.name)
+		w.WriteHeader(http.StatusOK)
+	})
+	req := httptest.NewRequest(http.MethodGet, "/secrets", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("Authorization", "Bearer "+tenants[len(tenants)-1].token)
+	rr := httptest.NewRecorder()
+	handler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (last tenant's token should authenticate)", rr.Code)
+	}
+	if len(compared) != 1 || compared[0] != tenants[len(tenants)-1].name {
+		t.Errorf("resolved tenant = %v, want [%s]", compared, tenants[len(tenants)-1].name)
+	}
+}
+
+func TestBearerMiddleware_SuccessLogNamesMatchedUser(t *testing.T) {
+	// spec: HTTP Authentication — success line carries the matched username
+	var buf bytes.Buffer
+	tenants := []tenant{
+		{name: "alice", token: tok('a')},
+		{name: "bob", token: tok('b')},
+	}
+	authMiddlewareWith(t, &buf, tenants, tok('b'), "127.0.0.1:12345", "1.2.3.4", http.MethodGet, "/secrets")
+	if !strings.Contains(buf.String(), "auth ok: GET /secrets from 1.2.3.4 as bob") {
+		t.Errorf("log %q: want auth ok line naming bob", buf.String())
+	}
+}
+
+func TestServe_StoreConstructionFailureIsStartupError(t *testing.T) {
+	// spec: Per-User Storage Isolation — Store construction failure is a startup error
+	secretsDir := t.TempDir()
+	// "alice" collides with an existing regular file directly under
+	// secrets_dir, so newStore's os.MkdirAll must fail.
+	if err := os.WriteFile(filepath.Join(secretsDir, "alice"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	users := []UserConfig{{Name: "alice", Token: tok('a')}}
+
+	// Mirrors serve()'s per-user store construction loop exactly.
+	var startupErr error
+	for _, u := range users {
+		if _, err := newStore(filepath.Join(secretsDir, u.Name)); err != nil {
+			startupErr = fmt.Errorf("init store for user %q: %w", u.Name, err)
+			break
+		}
+	}
+	if startupErr == nil {
+		t.Fatal("expected a startup error when a user's name collides with an existing regular file")
+	}
+	if !strings.Contains(startupErr.Error(), "alice") {
+		t.Errorf("error %q does not name the offending user", startupErr.Error())
 	}
 }
