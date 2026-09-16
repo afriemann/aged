@@ -12,7 +12,7 @@ Commands:
   serve                       start the HTTP server
   init                        generate a new age identity key (client-side; run on each machine using get/set)
   get <name>                  fetch a secret value (stdout only — suitable for chezmoi)
-  set <name>                  store a secret value (reads from stdin, encrypted locally before upload)
+  set <name> [value]          store a secret value (from argument, or from stdin if omitted; encrypted locally before upload)
   list                        list all secret names
   delete <name>               delete a secret
   rotate-token [<username>]   generate a new token and update the config file in place
@@ -42,6 +42,32 @@ func noArgs(cmd string) {
 		fmt.Fprintf(os.Stderr, "%s takes no arguments\nusage: aged %s\n", cmd, cmd)
 		os.Exit(1)
 	}
+}
+
+// stdinIsPiped reports whether stdin is connected to a pipe or redirected
+// file, as opposed to an interactive terminal.
+func stdinIsPiped() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice == 0
+}
+
+// parseSetArgs validates the "set" command's positional arguments (i.e.
+// os.Args[2:]) and extracts the secret name and, if present, the explicit
+// value argument. Exactly one or two arguments are accepted: <name> alone
+// (value comes from stdin) or <name> <value>.
+func parseSetArgs(args []string) (name string, argValue string, hasArg bool, err error) {
+	if len(args) < 1 || len(args) > 2 {
+		return "", "", false, fmt.Errorf("usage: aged set <name> [value]")
+	}
+	name = args[0]
+	if len(args) == 2 {
+		argValue = args[1]
+		hasArg = true
+	}
+	return name, argValue, hasArg, nil
 }
 
 // parseRotateIdentityArgs extracts the required new-identity-file path, the
@@ -90,11 +116,17 @@ func main() {
 		}
 		err = get(os.Args[2])
 	case "set":
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: aged set <name>")
+		name, argValue, hasArg, parseErr := parseSetArgs(os.Args[2:])
+		if parseErr != nil {
+			fmt.Fprintln(os.Stderr, parseErr)
 			os.Exit(1)
 		}
-		err = set(os.Args[2])
+		value, resolveErr := resolveSetValue(argValue, hasArg, stdinIsPiped(), os.Stdin)
+		if resolveErr != nil {
+			fmt.Fprintln(os.Stderr, "error:", resolveErr)
+			os.Exit(1)
+		}
+		err = set(name, value)
 	case "list":
 		noArgs("list")
 		err = list()
