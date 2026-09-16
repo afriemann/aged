@@ -42,13 +42,16 @@ jobs:
       - name: Test (race detector)
         run: go test -race ./...
 
-      # If this step fails unexpectedly on its first few runs with an
-      # internal go/packages type-resolution error rather than a real
-      # vulnerability finding, check for a stale Actions runner cache
-      # before assuming a real CVE was found.
+      # Deliberately does NOT pin go-version-file/go-version-input to this
+      # project's own toolchain: golang.org/x/vuln's @latest release can
+      # (and does) require a newer Go than this project pins, and chaining
+      # a second setup-go call after the main "Set up Go" step inherits a
+      # job-level GOTOOLCHAIN=local that makes the toolchain directive
+      # unreliable anyway. Let the action use its own default ('stable')
+      # Go toolchain to build and run govulncheck; it still scans this
+      # module's own source and dependency graph regardless of which Go
+      # binary is on PATH while it runs.
       - name: Vulnerability scan (govulncheck)
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
-          go-version-input: '' # blank the 'stable' default so go-version-file takes effect
-          go-version-file: go.mod
           repo-checkout: false
