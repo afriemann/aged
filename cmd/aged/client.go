@@ -125,10 +125,46 @@ func decryptCiphertext(ciphertext []byte, identities []age.Identity) ([]byte, er
 	return buf.Bytes(), nil
 }
 
-// set reads a secret value from stdin, encrypts it locally to the caller's
-// own identity — wrapped in a name-binding envelope — and uploads only the
-// resulting ciphertext. The server never sees the plaintext value.
-func set(name string) error {
+// resolveSetValue determines the plaintext secret value the set command
+// should use: an explicit CLI argument when hasArg is true, or content read
+// from stdin otherwise. It is an error to supply both an explicit argument
+// and piped stdin data (an ambiguous invocation), and an error for the
+// resolved value to be empty.
+//
+// Exactly one trailing newline is stripped from stdin content — not all of
+// them, matching ordinary shell echo/pipe conventions where a single
+// newline terminates the line but a value's own trailing newlines are
+// significant (see the analogous note on set's own former stdin handling).
+// An explicit argument value is used verbatim: the shell, not aged, is
+// responsible for whatever bytes it passes as an argument.
+func resolveSetValue(argValue string, hasArg bool, hasPipedStdin bool, stdin io.Reader) ([]byte, error) {
+	if hasArg && hasPipedStdin {
+		return nil, errors.New("value supplied as both an argument and via piped stdin; use only one")
+	}
+
+	var value []byte
+	if hasArg {
+		value = []byte(argValue)
+	} else {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+		value = bytes.TrimSuffix(data, []byte("\n"))
+	}
+
+	if len(value) == 0 {
+		return nil, errors.New("value must not be empty")
+	}
+	return value, nil
+}
+
+// set encrypts value locally to the caller's own identity — wrapped in a
+// name-binding envelope — and uploads only the resulting ciphertext. The
+// server never sees the plaintext value. The caller (main, via
+// resolveSetValue) is responsible for resolving value from an explicit
+// argument or from stdin.
+func set(name string, value []byte) error {
 	if !validName(name) {
 		return fmt.Errorf("invalid secret name: %q", name)
 	}
@@ -146,17 +182,7 @@ func set(name string) error {
 		return fmt.Errorf("identity file does not contain an X25519 identity")
 	}
 
-	data, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return fmt.Errorf("read stdin: %w", err)
-	}
-	// Strip exactly one trailing newline, if present — not all of them.
-	// strings/bytes.TrimRight would strip every trailing '\n', silently
-	// dropping bytes that are part of the actual value (e.g. a value whose
-	// last two bytes are both '\n'). TrimSuffix removes the suffix once.
-	data = bytes.TrimSuffix(data, []byte("\n"))
-
-	envelope := packEnvelope(name, data)
+	envelope := packEnvelope(name, value)
 
 	var buf bytes.Buffer
 	w, err := age.Encrypt(&buf, x25519.Recipient())

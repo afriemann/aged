@@ -1,6 +1,7 @@
 package main
 
 // spec: openspec/changes/client-side-encryption/specs/aged/spec.md
+// spec: openspec/changes/set-value-arg/specs/aged/spec.md
 
 import (
 	"bytes"
@@ -48,11 +49,9 @@ func TestClientSet(t *testing.T) {
 		dir := t.TempDir()
 		id := testClientEnv(t, filepath.Join(dir, "identity.age"))
 
-		withStdin(t, "my-plaintext-value", func() {
-			if err := set("some/key"); err != nil {
-				t.Fatalf("set: %v", err)
-			}
-		})
+		if err := set("some/key", []byte("my-plaintext-value")); err != nil {
+			t.Fatalf("set: %v", err)
+		}
 
 		// Read back the stored ciphertext directly via the server's own
 		// store to confirm the server only ever saw ciphertext.
@@ -73,46 +72,6 @@ func TestClientSet(t *testing.T) {
 		}
 	})
 
-	t.Run("Trailing newline stripped exactly once", func(t *testing.T) {
-		dir := t.TempDir()
-		id := testClientEnv(t, filepath.Join(dir, "identity.age"))
-
-		withStdin(t, "value-with-newline\n", func() {
-			if err := set("key"); err != nil {
-				t.Fatalf("set: %v", err)
-			}
-		})
-
-		stored := fetchRawStoredBytes(t, "key")
-		got, err := decryptWithIdentity(t, id, stored, "key")
-		if err != nil {
-			t.Fatalf("decrypt: %v", err)
-		}
-		if got != "value-with-newline" {
-			t.Errorf("got %q, want trailing newline stripped exactly once", got)
-		}
-	})
-
-	t.Run("Only one of several trailing newlines is stripped", func(t *testing.T) {
-		dir := t.TempDir()
-		id := testClientEnv(t, filepath.Join(dir, "identity.age"))
-
-		withStdin(t, "value\n\n\n", func() {
-			if err := set("key"); err != nil {
-				t.Fatalf("set: %v", err)
-			}
-		})
-
-		stored := fetchRawStoredBytes(t, "key")
-		got, err := decryptWithIdentity(t, id, stored, "key")
-		if err != nil {
-			t.Fatalf("decrypt: %v", err)
-		}
-		if got != "value\n\n" {
-			t.Errorf("got %q, want %q (only the last trailing newline stripped)", got, "value\n\n")
-		}
-	})
-
 	t.Run("Client rejects invalid name before encrypting", func(t *testing.T) {
 		dir := t.TempDir()
 		testClientEnv(t, filepath.Join(dir, "identity.age"))
@@ -121,12 +80,10 @@ func TestClientSet(t *testing.T) {
 		// test fails loudly if set() ever attempts a network request.
 		t.Setenv("AGED_SERVER_URL", "http://127.0.0.1:1")
 
-		withStdin(t, "value", func() {
-			err := set("../evil")
-			if err == nil {
-				t.Fatal("expected error for invalid name, got nil")
-			}
-		})
+		err := set("../evil", []byte("value"))
+		if err == nil {
+			t.Fatal("expected error for invalid name, got nil")
+		}
 	})
 }
 
@@ -369,5 +326,153 @@ func storeCiphertextViaHTTP(t *testing.T, recipient age.Recipient, name, value s
 	}
 	if status != http.StatusNoContent {
 		t.Fatalf("storeCiphertextViaHTTP: got status %d", status)
+	}
+}
+
+func TestResolveSetValue(t *testing.T) {
+	// spec: Client Secret Set Command
+
+	t.Run("Value supplied as argument", func(t *testing.T) {
+		got, err := resolveSetValue("12345", true, false, strings.NewReader(""))
+		if err != nil {
+			t.Fatalf("resolveSetValue: %v", err)
+		}
+		if string(got) != "12345" {
+			t.Errorf("got %q, want %q", got, "12345")
+		}
+	})
+
+	t.Run("Value supplied via stdin when argument omitted", func(t *testing.T) {
+		got, err := resolveSetValue("", false, true, strings.NewReader("12345\n"))
+		if err != nil {
+			t.Fatalf("resolveSetValue: %v", err)
+		}
+		if string(got) != "12345" {
+			t.Errorf("got %q, want %q", got, "12345")
+		}
+	})
+
+	t.Run("Only one trailing newline is stripped from stdin", func(t *testing.T) {
+		got, err := resolveSetValue("", false, true, strings.NewReader("value\n\n\n"))
+		if err != nil {
+			t.Fatalf("resolveSetValue: %v", err)
+		}
+		if string(got) != "value\n\n" {
+			t.Errorf("got %q, want %q (only the last trailing newline stripped)", got, "value\n\n")
+		}
+	})
+
+	t.Run("Argument value is used verbatim, not trimmed", func(t *testing.T) {
+		got, err := resolveSetValue("value\n", true, false, strings.NewReader(""))
+		if err != nil {
+			t.Fatalf("resolveSetValue: %v", err)
+		}
+		if string(got) != "value\n" {
+			t.Errorf("got %q, want %q (argument values are not trimmed)", got, "value\n")
+		}
+	})
+
+	t.Run("Value argument and piped stdin both present", func(t *testing.T) {
+		_, err := resolveSetValue("12345", true, true, strings.NewReader("67890"))
+		if err == nil {
+			t.Fatal("expected an error when both an argument and piped stdin are present, got nil")
+		}
+	})
+
+	t.Run("Empty value argument rejected", func(t *testing.T) {
+		_, err := resolveSetValue("", true, false, strings.NewReader(""))
+		if err == nil {
+			t.Fatal("expected an error for an empty argument value, got nil")
+		}
+	})
+
+	t.Run("Empty stdin value rejected", func(t *testing.T) {
+		_, err := resolveSetValue("", false, true, strings.NewReader("\n"))
+		if err == nil {
+			t.Fatal("expected an error for empty (newline-only) stdin content, got nil")
+		}
+	})
+}
+
+func TestParseSetArgs(t *testing.T) {
+	// spec: Client Secret Set Command — Too many arguments rejected (and
+	// the complementary happy-path shapes)
+	for _, tc := range []struct {
+		name         string
+		args         []string
+		wantName     string
+		wantArgValue string
+		wantHasArg   bool
+		wantErr      bool
+	}{
+		{"name only (value via stdin)", []string{"foobar"}, "foobar", "", false, false},
+		{"name and value", []string{"foobar", "12345"}, "foobar", "12345", true, false},
+		{"no arguments", []string{}, "", "", false, true},
+		{"Too many arguments rejected", []string{"foobar", "12345", "extra"}, "", "", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotName, gotArgValue, gotHasArg, err := parseSetArgs(tc.args)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseSetArgs(%v): expected an error, got nil", tc.args)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseSetArgs(%v): unexpected error: %v", tc.args, err)
+			}
+			if gotName != tc.wantName || gotArgValue != tc.wantArgValue || gotHasArg != tc.wantHasArg {
+				t.Errorf("parseSetArgs(%v) = (%q, %q, %v), want (%q, %q, %v)",
+					tc.args, gotName, gotArgValue, gotHasArg, tc.wantName, tc.wantArgValue, tc.wantHasArg)
+			}
+		})
+	}
+}
+
+func TestClientSet_ExplicitValueArgumentRoundTrip(t *testing.T) {
+	// spec: Client Secret Set Command — Value supplied as argument
+	dir := t.TempDir()
+	id := testClientEnv(t, filepath.Join(dir, "identity.age"))
+
+	value, err := resolveSetValue("12345", true, false, strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("resolveSetValue: %v", err)
+	}
+	if err := set("foobar", value); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	stored := fetchRawStoredBytes(t, "foobar")
+	got, err := decryptWithIdentity(t, id, stored, "foobar")
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if got != "12345" {
+		t.Errorf("got %q, want %q", got, "12345")
+	}
+}
+
+func TestClientSet_StdinValueRoundTrip(t *testing.T) {
+	// spec: Client Secret Set Command — Value supplied via stdin when argument omitted
+	dir := t.TempDir()
+	id := testClientEnv(t, filepath.Join(dir, "identity.age"))
+
+	withStdin(t, "12345\n", func() {
+		value, err := resolveSetValue("", false, true, os.Stdin)
+		if err != nil {
+			t.Fatalf("resolveSetValue: %v", err)
+		}
+		if err := set("foobar", value); err != nil {
+			t.Fatalf("set: %v", err)
+		}
+	})
+
+	stored := fetchRawStoredBytes(t, "foobar")
+	got, err := decryptWithIdentity(t, id, stored, "foobar")
+	if err != nil {
+		t.Fatalf("decrypt: %v", err)
+	}
+	if got != "12345" {
+		t.Errorf("got %q, want %q", got, "12345")
 	}
 }
