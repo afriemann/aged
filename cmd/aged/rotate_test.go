@@ -2,6 +2,7 @@ package main
 
 // spec: openspec/changes/rotate-token/specs/aged/spec.md
 // spec: openspec/changes/security-hardening/specs/aged/spec.md
+// spec: openspec/changes/multi-user-support/specs/aged/spec.md
 
 import (
 	"bytes"
@@ -28,39 +29,64 @@ func writeTestConfig(t *testing.T, dir string, content map[string]any) string {
 	return path
 }
 
+// oneUserConfig returns a config map with a single [[users]] entry, suitable
+// for writeTestConfig, plus any extra top-level fields merged in.
+func oneUserConfig(name, token string, extra map[string]any) map[string]any {
+	cfg := map[string]any{
+		"users": []map[string]any{{"name": name, "token": token}},
+	}
+	for k, v := range extra {
+		cfg[k] = v
+	}
+	return cfg
+}
+
+// decodedUsers re-reads path and returns its users array as
+// []map[string]any, regardless of whether rotateToken serialised it that way
+// or the fixture was written differently.
+func decodedUsers(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	var cfg map[string]any
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	entries, err := decodeUsersValue(cfg["users"])
+	if err != nil {
+		t.Fatalf("decodeUsersValue: %v", err)
+	}
+	return entries
+}
+
 func TestRotateToken_RotatesTokenInConfigFile(t *testing.T) {
 	// spec: Token Rotation — Rotates token in config file
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{
-		"token":      "old-token-value",
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), map[string]any{
 		"server_url": "https://aged.example.com",
-	})
+	}))
 	t.Setenv("AGED_CONFIG", path)
 
 	var stdout bytes.Buffer
-	if err := rotateToken(&stdout); err != nil {
+	if err := rotateToken(&stdout, ""); err != nil {
 		t.Fatalf("rotateToken: %v", err)
 	}
 
-	// Token in file must have changed.
-	var updated map[string]any
-	if _, err := toml.DecodeFile(path, &updated); err != nil {
-		t.Fatalf("decode updated config: %v", err)
-	}
-	newToken, _ := updated["token"].(string)
-	if newToken == "old-token-value" {
+	entries := decodedUsers(t, path)
+	newToken, _ := entries[0]["token"].(string)
+	if newToken == tok('a') {
 		t.Error("token was not rotated")
 	}
 	if newToken == "" {
 		t.Error("new token is empty")
 	}
-
-	// New token printed to stdout.
 	if !strings.Contains(stdout.String(), newToken) {
 		t.Errorf("stdout %q does not contain new token %q", stdout.String(), newToken)
 	}
+	if !strings.Contains(stdout.String(), "alice") {
+		t.Errorf("stdout %q does not name the rotated user", stdout.String())
+	}
 
-	// Other fields preserved.
+	var updated map[string]any
+	toml.DecodeFile(path, &updated)
 	if updated["server_url"] != "https://aged.example.com" {
 		t.Errorf("server_url changed: got %v", updated["server_url"])
 	}
@@ -69,14 +95,13 @@ func TestRotateToken_RotatesTokenInConfigFile(t *testing.T) {
 func TestRotateToken_OldAndNewTokensDiffer(t *testing.T) {
 	// spec: Token Rotation — Rotates token in config file (old and new differ)
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "original"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
-	rotateToken(&bytes.Buffer{})
+	rotateToken(&bytes.Buffer{}, "")
 
-	var cfg map[string]any
-	toml.DecodeFile(path, &cfg)
-	if cfg["token"] == "original" {
+	entries := decodedUsers(t, path)
+	if entries[0]["token"] == tok('a') {
 		t.Error("token unchanged after rotation")
 	}
 }
@@ -87,7 +112,7 @@ func TestRotateToken_NoConfigFileReturnsError(t *testing.T) {
 	t.Setenv("AGED_CONFIG", "/tmp/aged-definitely-does-not-exist-test.toml")
 	t.Setenv("HOME", emptyHome) // prevent ~/.config/aged/config.toml from being found
 
-	err := rotateToken(&bytes.Buffer{})
+	err := rotateToken(&bytes.Buffer{}, "")
 	if err == nil {
 		t.Fatal("expected error when no config file found, got nil")
 	}
@@ -96,18 +121,16 @@ func TestRotateToken_NoConfigFileReturnsError(t *testing.T) {
 func TestRotateToken_TwoRotationsProduceDifferentTokens(t *testing.T) {
 	// spec: Token Rotation — New token is cryptographically random
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "seed"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
-	rotateToken(&bytes.Buffer{})
-	var first map[string]any
-	toml.DecodeFile(path, &first)
+	rotateToken(&bytes.Buffer{}, "")
+	first := decodedUsers(t, path)
 
-	rotateToken(&bytes.Buffer{})
-	var second map[string]any
-	toml.DecodeFile(path, &second)
+	rotateToken(&bytes.Buffer{}, "")
+	second := decodedUsers(t, path)
 
-	if first["token"] == second["token"] {
+	if first[0]["token"] == second[0]["token"] {
 		t.Error("two consecutive rotations produced the same token")
 	}
 }
@@ -118,7 +141,7 @@ func TestRotateToken_AtomicWrite_OriginalIntactOnError(t *testing.T) {
 		t.Skip("cannot test filesystem permissions as root")
 	}
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "original-token"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
 	originalContent, err := os.ReadFile(path)
@@ -133,7 +156,7 @@ func TestRotateToken_AtomicWrite_OriginalIntactOnError(t *testing.T) {
 	// Always restore before TempDir cleanup runs.
 	t.Cleanup(func() { os.Chmod(dir, 0o755) })
 
-	if err := rotateToken(&bytes.Buffer{}); err == nil {
+	if err := rotateToken(&bytes.Buffer{}, ""); err == nil {
 		t.Fatal("expected error when directory is not writable, got nil")
 	}
 
@@ -161,10 +184,10 @@ func TestRotateToken_AtomicWrite_OriginalIntactOnError(t *testing.T) {
 func TestRotateToken_NoTempFilesAfterSuccess(t *testing.T) {
 	// spec: Token Rotation — Failed write leaves original config intact (success path cleanup)
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "start"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
-	if err := rotateToken(&bytes.Buffer{}); err != nil {
+	if err := rotateToken(&bytes.Buffer{}, ""); err != nil {
 		t.Fatalf("rotateToken: %v", err)
 	}
 
@@ -202,7 +225,7 @@ func TestFileOwner(t *testing.T) {
 func TestRotateToken_PreservesOwnership(t *testing.T) {
 	// spec: Token Rotation — Preserves file ownership across rotation
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "original"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
 	origInfo, err := os.Stat(path)
@@ -228,7 +251,7 @@ func TestRotateToken_PreservesOwnership(t *testing.T) {
 	}
 	t.Cleanup(func() { chownFunc = origChown })
 
-	if err := rotateToken(&bytes.Buffer{}); err != nil {
+	if err := rotateToken(&bytes.Buffer{}, ""); err != nil {
 		t.Fatalf("rotateToken: %v", err)
 	}
 
@@ -246,7 +269,7 @@ func TestRotateToken_PreservesOwnership(t *testing.T) {
 func TestRotateToken_OwnershipPreservationFailureAbortsRotation(t *testing.T) {
 	// spec: Token Rotation — Failed write leaves original config intact (ownership variant)
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "original-token"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
 	originalContent, err := os.ReadFile(path)
@@ -260,7 +283,7 @@ func TestRotateToken_OwnershipPreservationFailureAbortsRotation(t *testing.T) {
 	}
 	t.Cleanup(func() { chownFunc = origChown })
 
-	if err := rotateToken(&bytes.Buffer{}); err == nil {
+	if err := rotateToken(&bytes.Buffer{}, ""); err == nil {
 		t.Fatal("expected an error when ownership preservation fails, got nil")
 	}
 
@@ -283,7 +306,7 @@ func TestRotateToken_OwnershipPreservationFailureAbortsRotation(t *testing.T) {
 func TestRotateToken_WarnsWhenOwnerCannotBeDetermined(t *testing.T) {
 	// spec: Token Rotation — Preserves file ownership across rotation (owner-undeterminable variant)
 	dir := t.TempDir()
-	path := writeTestConfig(t, dir, map[string]any{"token": "original"})
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
 	t.Setenv("AGED_CONFIG", path)
 
 	origFileOwner := fileOwnerFunc
@@ -291,10 +314,168 @@ func TestRotateToken_WarnsWhenOwnerCannotBeDetermined(t *testing.T) {
 	t.Cleanup(func() { fileOwnerFunc = origFileOwner })
 
 	var stdout bytes.Buffer
-	if err := rotateToken(&stdout); err != nil {
+	if err := rotateToken(&stdout, ""); err != nil {
 		t.Fatalf("rotateToken: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "ownership") {
 		t.Errorf("stdout %q does not warn about undetermined ownership", stdout.String())
+	}
+}
+
+func TestRotateToken_UsernameRequiredWithMultipleUsers(t *testing.T) {
+	// spec: Token Rotation — Username required with multiple users
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, map[string]any{
+		"users": []map[string]any{
+			{"name": "alice", "token": tok('a')},
+			{"name": "bob", "token": tok('b')},
+		},
+	})
+	t.Setenv("AGED_CONFIG", path)
+
+	err := rotateToken(&bytes.Buffer{}, "")
+	if err == nil {
+		t.Fatal("expected an error when username is omitted with multiple users")
+	}
+	if !strings.Contains(err.Error(), "alice") || !strings.Contains(err.Error(), "bob") {
+		t.Errorf("error %q does not list the configured user names", err.Error())
+	}
+}
+
+func TestRotateToken_UnknownUsernameListsConfiguredNames(t *testing.T) {
+	// spec: Token Rotation — Unknown username lists configured names
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, oneUserConfig("alice", tok('a'), nil))
+	t.Setenv("AGED_CONFIG", path)
+
+	err := rotateToken(&bytes.Buffer{}, "carol")
+	if err == nil {
+		t.Fatal("expected an error for an unknown username")
+	}
+	if !strings.Contains(err.Error(), "alice") {
+		t.Errorf("error %q does not list the configured user names", err.Error())
+	}
+}
+
+func TestRotateToken_SingleUserAutoSelectedAndPrinted(t *testing.T) {
+	// spec: Token Rotation — the argument, if omitted, SHALL default to that
+	// user; its name SHALL be printed regardless of whether it was given
+	// explicitly.
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, oneUserConfig("laptop", tok('a'), nil))
+	t.Setenv("AGED_CONFIG", path)
+
+	var stdout bytes.Buffer
+	if err := rotateToken(&stdout, ""); err != nil {
+		t.Fatalf("rotateToken: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "laptop") {
+		t.Errorf("stdout %q must name the auto-selected user", stdout.String())
+	}
+}
+
+func TestRotateToken_MalformedUsersValueProducesCleanError(t *testing.T) {
+	// spec: Token Rotation — Malformed users value produces a clean error
+	for _, tc := range []struct {
+		name  string
+		value map[string]any
+	}{
+		{"inline table", map[string]any{"users": map[string]any{"name": "alice", "token": tok('a')}}},
+		{"scalar", map[string]any{"users": "not-an-array"}},
+		{"missing name field", map[string]any{"users": []map[string]any{{"token": tok('a')}}}},
+		{"missing token field", map[string]any{"users": []map[string]any{{"name": "alice"}}}},
+		{"non-string name", map[string]any{"users": []map[string]any{{"name": 42, "token": tok('a')}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeTestConfig(t, dir, tc.value)
+			t.Setenv("AGED_CONFIG", path)
+
+			// Must not panic.
+			err := rotateToken(&bytes.Buffer{}, "")
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+		})
+	}
+
+	t.Run("no users key at all", func(t *testing.T) {
+		dir := t.TempDir()
+		path := writeTestConfig(t, dir, map[string]any{"server_url": "https://example.com"})
+		t.Setenv("AGED_CONFIG", path)
+
+		err := rotateToken(&bytes.Buffer{}, "")
+		if err == nil {
+			t.Fatal("expected an error when the config defines no [[users]], got nil")
+		}
+	})
+}
+
+func TestRotateToken_InlineUsersArrayDecodesWithoutPanic(t *testing.T) {
+	// spec: Token Rotation — the command SHALL decode the config file's
+	// "users" value defensively; an inline `users = [{...}]` array parses
+	// to []any (not []map[string]any) per BurntSushi/toml v1.6.0.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := "users = [{ name = \"alice\", token = \"" + tok('a') + "\" }]\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("AGED_CONFIG", path)
+
+	if err := rotateToken(&bytes.Buffer{}, ""); err != nil {
+		t.Fatalf("rotateToken with inline users array: %v", err)
+	}
+}
+
+func TestRotateToken_BlockedByStructuralProblemOnAnotherUser(t *testing.T) {
+	// spec: Token Rotation — Rotation is blocked by a structural problem on another user
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, map[string]any{
+		"users": []map[string]any{
+			{"name": "-invalid", "token": tok('a')},
+			{"name": "bob", "token": tok('b')},
+		},
+	})
+	t.Setenv("AGED_CONFIG", path)
+	originalContent, _ := os.ReadFile(path)
+
+	err := rotateToken(&bytes.Buffer{}, "bob")
+	if err == nil {
+		t.Fatal("expected an error when another user has a structural problem")
+	}
+	content, _ := os.ReadFile(path)
+	if !bytes.Equal(content, originalContent) {
+		t.Error("config file was modified despite the rotation being blocked")
+	}
+}
+
+func TestRotateToken_ProceedsDespiteAnotherUsersMalformedToken(t *testing.T) {
+	// spec: Token Rotation — Rotation proceeds despite another user's malformed token
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, map[string]any{
+		"users": []map[string]any{
+			{"name": "alice", "token": "not-64-hex-chars"},
+			{"name": "bob", "token": tok('b')},
+		},
+	})
+	t.Setenv("AGED_CONFIG", path)
+
+	var stdout bytes.Buffer
+	if err := rotateToken(&stdout, "bob"); err != nil {
+		t.Fatalf("rotateToken: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "alice") {
+		t.Errorf("stdout %q must warn naming the malformed user alice", stdout.String())
+	}
+	entries := decodedUsers(t, path)
+	var bobToken string
+	for _, e := range entries {
+		if e["name"] == "bob" {
+			bobToken, _ = e["token"].(string)
+		}
+	}
+	if bobToken == tok('b') {
+		t.Error("bob's token was not rotated")
 	}
 }

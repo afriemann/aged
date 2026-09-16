@@ -180,3 +180,48 @@ func TestLoadConfig_IdentityExplicitFlag(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadConfig_DecodesUsersArray(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfgFile, []byte(`
+[[users]]
+name = "alice"
+token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[users]]
+name = "bob"
+token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+`), 0o600)
+	t.Setenv("AGED_CONFIG", cfgFile)
+	t.Setenv("AGED_TOKEN", "")
+	t.Setenv("AGED_USERNAME", "")
+
+	cfg := loadConfig()
+	if len(cfg.Users) != 2 {
+		t.Fatalf("got %d users, want 2", len(cfg.Users))
+	}
+	if cfg.Users[0].Name != "alice" || cfg.Users[1].Name != "bob" {
+		t.Errorf("got users %+v, want alice then bob in file order", cfg.Users)
+	}
+}
+
+func TestLoadConfig_CapturesEnvUserPair(t *testing.T) {
+	t.Setenv("AGED_CONFIG", "/tmp/definitely-absent-aged-test.toml")
+	t.Setenv("AGED_TOKEN", "sometoken")
+	t.Setenv("AGED_USERNAME", "laptop")
+
+	cfg := loadConfig()
+	if cfg.envToken != "sometoken" || cfg.envUsername != "laptop" {
+		t.Errorf("got envToken=%q envUsername=%q, want sometoken/laptop", cfg.envToken, cfg.envUsername)
+	}
+	// loadConfig itself must not merge these into cfg.Users — that is a
+	// server-only concern, and cfg.Token must remain the client's own
+	// credential, untouched by AGED_USERNAME.
+	if cfg.Token != "sometoken" {
+		t.Errorf("cfg.Token = %q, want it to still carry the client credential", cfg.Token)
+	}
+	if len(cfg.Users) != 0 {
+		t.Errorf("loadConfig must not merge the env pair into Users; got %+v", cfg.Users)
+	}
+}

@@ -15,13 +15,19 @@ import (
 )
 
 // rotateTestEnv sets up cfg.Identity (old) + cfg.SecretsDir pointing at a
-// temp directory, and returns the old identity plus a helper to store a raw
+// temp base directory, configures a single user ("testuser") via the
+// AGED_USERNAME/AGED_TOKEN environment pair, and returns the old identity
+// plus that user's effective secrets subtree (secrets_dir/testuser) — the
+// directory rotateIdentity actually operates on with an empty username (it
+// auto-selects the sole configured user). A helper to store a raw
 // (possibly-unbound) ciphertext secret directly on disk, bypassing any
-// envelope logic — used to construct legacy/misfiled fixtures.
+// envelope logic, is also provided — used to construct legacy/misfiled
+// fixtures.
 func rotateTestEnv(t *testing.T) (oldIdentity *age.X25519Identity, secretsDir string) {
 	t.Helper()
 	dir := t.TempDir()
-	secretsDir = filepath.Join(dir, "secrets")
+	baseSecretsDir := filepath.Join(dir, "secrets")
+	secretsDir = filepath.Join(baseSecretsDir, "testuser")
 	if err := os.MkdirAll(secretsDir, 0o700); err != nil {
 		t.Fatalf("mkdir secrets: %v", err)
 	}
@@ -37,8 +43,9 @@ func rotateTestEnv(t *testing.T) (oldIdentity *age.X25519Identity, secretsDir st
 
 	t.Setenv("AGED_CONFIG", "/tmp/definitely-absent-aged-test.toml")
 	t.Setenv("AGED_IDENTITY", identityPath)
-	t.Setenv("AGED_SECRETS_DIR", secretsDir)
-	t.Setenv("AGED_TOKEN", testToken)
+	t.Setenv("AGED_SECRETS_DIR", baseSecretsDir)
+	t.Setenv("AGED_TOKEN", tok('a'))
+	t.Setenv("AGED_USERNAME", "testuser")
 	t.Setenv("AGED_ADDR", "127.0.0.1:0")
 
 	return oldIdentity, secretsDir
@@ -92,7 +99,7 @@ func TestRotateIdentity(t *testing.T) {
 		before, _ := os.ReadDir(secretsDir)
 
 		var out bytes.Buffer
-		if err := rotateIdentity(newIdentityFile, true, &out); err != nil {
+		if err := rotateIdentity(newIdentityFile, "", true, &out); err != nil {
 			t.Fatalf("rotateIdentity --dry-run: %v", err)
 		}
 		if !strings.Contains(out.String(), "2 secret(s) would migrate successfully") {
@@ -118,7 +125,7 @@ func TestRotateIdentity(t *testing.T) {
 		newIdentityFile, newID := newTestIdentityFile(t)
 
 		var out bytes.Buffer
-		if err := rotateIdentity(newIdentityFile, false, &out); err != nil {
+		if err := rotateIdentity(newIdentityFile, "", false, &out); err != nil {
 			t.Fatalf("rotateIdentity: %v", err)
 		}
 
@@ -172,7 +179,7 @@ func TestRotateIdentity(t *testing.T) {
 		t.Cleanup(func() { rotateIdentityCorruptStagedFileHook = nil })
 
 		var out bytes.Buffer
-		err := rotateIdentity(newIdentityFile, false, &out)
+		err := rotateIdentity(newIdentityFile, "", false, &out)
 		if err == nil {
 			t.Fatal("expected an error from a verification failure, got nil")
 		}
@@ -196,13 +203,13 @@ func TestRotateIdentity(t *testing.T) {
 		t.Setenv("AGED_ADDR", ln.Addr().String())
 
 		var out bytes.Buffer
-		if err := rotateIdentity(newIdentityFile, false, &out); err == nil {
+		if err := rotateIdentity(newIdentityFile, "", false, &out); err == nil {
 			t.Error("expected refusal while address is in use, got nil error")
 		}
 
 		// --dry-run must proceed anyway.
 		var dryOut bytes.Buffer
-		if err := rotateIdentity(newIdentityFile, true, &dryOut); err != nil {
+		if err := rotateIdentity(newIdentityFile, "", true, &dryOut); err != nil {
 			t.Errorf("--dry-run should proceed even while the server is listening: %v", err)
 		}
 	})
@@ -215,7 +222,7 @@ func TestRotateIdentity(t *testing.T) {
 		newIdentityFile, newID := newTestIdentityFile(t)
 
 		var out bytes.Buffer
-		if err := rotateIdentity(newIdentityFile, false, &out); err != nil {
+		if err := rotateIdentity(newIdentityFile, "", false, &out); err != nil {
 			t.Fatalf("rotateIdentity: %v", err)
 		}
 
@@ -246,7 +253,7 @@ func TestRotateIdentity(t *testing.T) {
 		before := snapshotDir(t, secretsDir)
 
 		var out bytes.Buffer
-		err := rotateIdentity(newIdentityFile, false, &out)
+		err := rotateIdentity(newIdentityFile, "", false, &out)
 		if err == nil {
 			t.Fatal("expected an error for a misfiled secret, got nil")
 		}
@@ -273,7 +280,7 @@ func TestRotateIdentity(t *testing.T) {
 		f.Close()
 
 		var out bytes.Buffer
-		err := rotateIdentity(multiPath, false, &out)
+		err := rotateIdentity(multiPath, "", false, &out)
 		if err == nil {
 			t.Fatal("expected an error for a multi-identity new-identity file, got nil")
 		}
@@ -285,7 +292,7 @@ func TestRotateIdentity(t *testing.T) {
 		newIdentityFile, newID := newTestIdentityFile(t)
 
 		var out bytes.Buffer
-		if err := rotateIdentity(newIdentityFile, false, &out); err != nil {
+		if err := rotateIdentity(newIdentityFile, "", false, &out); err != nil {
 			t.Fatalf("rotateIdentity: %v", err)
 		}
 
@@ -327,5 +334,143 @@ func walkDirSorted(t *testing.T, dir string, fn func(path string, data []byte)) 
 			t.Fatalf("read file %s: %v", full, err)
 		}
 		fn(full, data)
+	}
+}
+
+func TestRotateIdentity_RefusesWithoutUserWhenMultipleConfigured(t *testing.T) {
+	// spec: Identity Rotation — Refuses to run without --user when multiple users are configured
+	oldID, secretsDir := rotateTestEnv(t)
+	putRawSecret(t, secretsDir, "a", oldID.Recipient(), packEnvelope("a", []byte("v")))
+	// Add a second user via a config file (env pair already defines "testuser").
+	baseSecretsDir := filepath.Dir(secretsDir)
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfgPath, []byte(fmt.Sprintf(
+		"secrets_dir = %q\n[[users]]\nname = \"other\"\ntoken = \"%s\"\n",
+		baseSecretsDir, tok('b'),
+	)), 0o600)
+	t.Setenv("AGED_CONFIG", cfgPath)
+
+	newIdentityFile, _ := newTestIdentityFile(t)
+	var out bytes.Buffer
+	err := rotateIdentity(newIdentityFile, "", false, &out)
+	if err == nil {
+		t.Fatal("expected an error when --user is omitted with multiple users configured")
+	}
+	if !strings.Contains(err.Error(), "testuser") || !strings.Contains(err.Error(), "other") {
+		t.Errorf("error %q must list the configured user names", err.Error())
+	}
+}
+
+func TestRotateIdentity_DefaultsToSoleUserAndPrintsName(t *testing.T) {
+	// spec: Identity Rotation — Defaults to the sole user when exactly one is configured
+	oldID, secretsDir := rotateTestEnv(t)
+	putRawSecret(t, secretsDir, "a", oldID.Recipient(), packEnvelope("a", []byte("v")))
+	newIdentityFile, _ := newTestIdentityFile(t)
+
+	var out bytes.Buffer
+	if err := rotateIdentity(newIdentityFile, "", false, &out); err != nil {
+		t.Fatalf("rotateIdentity: %v", err)
+	}
+	if !strings.Contains(out.String(), "testuser") {
+		t.Errorf("output %q must name the auto-selected sole user", out.String())
+	}
+}
+
+func TestRotateIdentity_OperatesOnlyOnSelectedUsersSubtree(t *testing.T) {
+	// spec: Identity Rotation — Operates only on the selected user's subtree
+	dir := t.TempDir()
+	baseSecretsDir := filepath.Join(dir, "secrets")
+
+	oldID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate old identity: %v", err)
+	}
+	identityPath := filepath.Join(dir, "old-identity.age")
+	f, _ := os.OpenFile(identityPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	fmt.Fprintf(f, "# test\n%s\n", oldID)
+	f.Close()
+
+	cfgPath := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfgPath, []byte(fmt.Sprintf(
+		"secrets_dir = %q\nidentity = %q\n[[users]]\nname = \"alice\"\ntoken = \"%s\"\n[[users]]\nname = \"bob\"\ntoken = \"%s\"\n",
+		baseSecretsDir, identityPath, tok('a'), tok('b'),
+	)), 0o600)
+	t.Setenv("AGED_CONFIG", cfgPath)
+	t.Setenv("AGED_ADDR", "127.0.0.1:0")
+
+	aliceDir := filepath.Join(baseSecretsDir, "alice")
+	bobDir := filepath.Join(baseSecretsDir, "bob")
+	os.MkdirAll(aliceDir, 0o700)
+	os.MkdirAll(bobDir, 0o700)
+	putRawSecret(t, aliceDir, "alice-secret", oldID.Recipient(), packEnvelope("alice-secret", []byte("alice-value")))
+	putRawSecret(t, bobDir, "bob-secret", oldID.Recipient(), packEnvelope("bob-secret", []byte("bob-value")))
+
+	bobSnapshotBefore := snapshotDir(t, bobDir)
+
+	newIdentityFile, newID := newTestIdentityFile(t)
+	var out bytes.Buffer
+	if err := rotateIdentity(newIdentityFile, "alice", false, &out); err != nil {
+		t.Fatalf("rotateIdentity: %v", err)
+	}
+
+	// Alice's secret is now decryptable with the new identity.
+	aliceCiphertext, err := os.ReadFile(filepath.Join(aliceDir, "alice-secret.age"))
+	if err != nil {
+		t.Fatalf("read alice's migrated secret: %v", err)
+	}
+	plaintext, err := decryptCiphertext(aliceCiphertext, []age.Identity{newID})
+	if err != nil {
+		t.Fatalf("decrypt alice's secret with new identity: %v", err)
+	}
+	value, err := unpackEnvelope("alice-secret", plaintext)
+	if err != nil || string(value) != "alice-value" {
+		t.Errorf("alice's secret: got (%q, %v), want (\"alice-value\", nil)", value, err)
+	}
+
+	// Bob's directory is completely untouched.
+	if snapshotDir(t, bobDir) != bobSnapshotBefore {
+		t.Error("bob's secrets were modified by a rotation scoped to alice")
+	}
+}
+
+func TestRotateIdentity_WarnsAboutOtherUsersStructuralProblems(t *testing.T) {
+	// spec: (SUGGESTION from code review) rotate-identity should surface,
+	// as a warning, a structural problem on a user OTHER than the one
+	// being operated on — mirroring rotate-token's D5.3 policy — so an
+	// operator gets the same signal `aged serve` would give at its own
+	// startup validation, without being blocked from operating on the
+	// (valid) target user.
+	dir := t.TempDir()
+	baseSecretsDir := filepath.Join(dir, "secrets")
+
+	oldID, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate old identity: %v", err)
+	}
+	identityPath := filepath.Join(dir, "old-identity.age")
+	f, _ := os.OpenFile(identityPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	fmt.Fprintf(f, "# test\n%s\n", oldID)
+	f.Close()
+
+	cfgPath := filepath.Join(dir, "config.toml")
+	os.WriteFile(cfgPath, []byte(fmt.Sprintf(
+		"secrets_dir = %q\nidentity = %q\n[[users]]\nname = \"alice\"\ntoken = \"%s\"\n[[users]]\nname = \"-bad\"\ntoken = \"%s\"\n",
+		baseSecretsDir, identityPath, tok('a'), tok('b'),
+	)), 0o600)
+	t.Setenv("AGED_CONFIG", cfgPath)
+	t.Setenv("AGED_ADDR", "127.0.0.1:0")
+
+	aliceDir := filepath.Join(baseSecretsDir, "alice")
+	os.MkdirAll(aliceDir, 0o700)
+	putRawSecret(t, aliceDir, "secret", oldID.Recipient(), packEnvelope("secret", []byte("v")))
+
+	newIdentityFile, _ := newTestIdentityFile(t)
+	var out bytes.Buffer
+	if err := rotateIdentity(newIdentityFile, "alice", false, &out); err != nil {
+		t.Fatalf("rotateIdentity: %v", err)
+	}
+	if !strings.Contains(out.String(), "-bad") {
+		t.Errorf("output %q must warn naming the other user's structural problem", out.String())
 	}
 }
