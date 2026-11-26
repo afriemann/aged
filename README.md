@@ -66,8 +66,6 @@ secrets.home.example.com {
 }
 ```
 
-**Migrating an existing (pre-client-side-encryption) deployment:** if you're upgrading a server that previously held its own identity, see [Migrating to client-side encryption](#migrating-to-client-side-encryption) before installing the new binary — you need to re-encrypt your existing secrets onto a new, client-held identity first.
-
 ## Configuration
 
 aged can be configured via a TOML config file, environment variables, or both. Environment variables always take precedence over the config file.
@@ -100,7 +98,7 @@ name  = "ci-runner"
 token = "<generate with: openssl rand -hex 32>"
 ```
 
-Each user's `name` is also how you address them in `aged rotate-token <name>` and `aged rotate-identity <file> --user <name>` — **recommend encoding the machine or purpose in the name itself** (`laptop`, `ci-runner`), since `rotate-token` does not preserve config-file comments across a rotation, but the name always survives and appears in the `auth ok: … as <user>` log line.
+Each user's `name` is also how you address them in `aged rotate-token <name>` — **recommend encoding the machine or purpose in the name itself** (`laptop`, `ci-runner`), since `rotate-token` does not preserve config-file comments across a rotation, but the name always survives and appears in the `auth ok: … as <user>` log line.
 
 A single-user deployment with no config file at all can instead set both `AGED_USERNAME` and `AGED_TOKEN` — this is the simplest way to run one tenant without a config file:
 
@@ -138,10 +136,10 @@ Setting only one of the two is refused at startup (naming which one is missing) 
 | `AGED_USERNAME` | — | — | server-only; combines with `AGED_TOKEN` to define one server user |
 | `AGED_SECRETS_DIR` | `secrets_dir` | `~/.config/aged/secrets/` | server |
 | `AGED_ADDR` | `addr` | `127.0.0.1:8743` | server |
-| `AGED_IDENTITY` | `identity` | `~/.config/aged/identity.age` | **client only** — `get`/`set`/`pubkey`/`rotate-identity` |
+| `AGED_IDENTITY` | `identity` | `~/.config/aged/identity.age` | **client only** — `get`/`set`/`pubkey`/`trust` |
 | `AGED_SERVER_URL` | `server_url` | `http://localhost:8743` | client |
 
-If `identity`/`AGED_IDENTITY` is still set for `aged serve`, the server logs a startup warning naming the file — it's unused and should be secured or removed once you've verified migration (see below).
+If `identity`/`AGED_IDENTITY` is still set for `aged serve`, the server logs a startup warning naming the file — it's unused and should be secured or removed once you have verified client-side encryption works.
 
 ## Client usage
 
@@ -189,40 +187,32 @@ aged pubkey
 aged rotate-token [<username>]
 ```
 
-**Using aged from more than one machine:** copy your `identity.age` file to every machine you run `get`/`set` from, protected with at least the rigour you'd apply to the bearer token — see [Migrating to client-side encryption](#migrating-to-client-side-encryption) for concrete guidance, since the identity file is now more sensitive than the token.
+## Multiple devices (`aged trust`)
 
-## Migrating to client-side encryption
+Each device has its own identity (`aged init`) and shares the user's bearer token. Secrets are encrypted to a set of trusted keys, kept in a **trust manifest** stored on the server as an age-encrypted blob (reserved name `.aged/trust`, encrypted to the default set, so the server cannot read it).
 
-If you're upgrading an existing aged deployment whose server previously held its own identity, follow this runbook **before** switching to the new binary in production.
+```sh
+# on device A: grant device B's key access to everything
+aged trust add age1…B
 
-**The new identity must be generated on, and never leave, an actual client machine** — not the server. `aged rotate-identity` needs the new identity's *private* key present wherever it runs (it decrypts its own freshly re-encrypted output to verify before swapping anything), so **run the migration itself on that same client machine**, not on the server — otherwise the server ends up holding the very private key this change exists to keep it from ever seeing, even if only transiently.
+# grant a key access to one secret only
+aged trust add age1…C --secret ha-token
 
-1. **Deploy the new binary** to the server host and to every client machine — this is a breaking wire-format change; do not run mismatched versions against each other.
-2. **Stop `aged serve`.**
-3. **On the client machine you intend to use going forward, generate its identity:** `aged init`. This key is born here and stays here — it is never copied to or generated on the server, including during the steps below.
-4. **Temporarily copy the server's current ciphertext store and its old identity file to that same client machine**, over an already-authenticated channel (e.g. `scp` over an existing SSH session to a known-host-verified server), into a scratch location distinct from the client's own `secrets_dir`/`identity` — e.g. `~/aged-migration-scratch/{secrets,old-identity.age}`. The server's originals are left in place untouched at this point.
-5. **Dry run, on the client, against the scratch copy:**
-   ```sh
-   AGED_IDENTITY=~/aged-migration-scratch/old-identity.age \
-   AGED_SECRETS_DIR=~/aged-migration-scratch/secrets \
-     aged rotate-identity ~/.config/aged/identity.age --dry-run
-   ```
-   Confirm the reported count matches the number of secrets you expect, with zero failures. (`~/.config/aged/identity.age` here is the identity you just generated in step 3 — the target of the migration, not something copied from the server.)
-6. **Run it for real** (same command, without `--dry-run`). This stages every secret, verifies each one individually against the client's own new identity, then swaps the *scratch copy* atomically — the client's new private key never leaves this machine at any point in this process.
-7. **On the server, make room for the migrated store**: rename the live `secrets_dir` aside as your own backup (e.g. `mv /path/to/secrets /path/to/secrets.old-<timestamp>`) — this is the server-side equivalent of the atomic-swap backup `rotate-identity` would have made if it had run in place, and gives you the same rollback safety net.
-8. **Copy the migrated scratch secrets directory back to the server**, into the now-empty `secrets_dir` path, preserving ownership/permissions (`0700` dirs, `0600` files, owned by whatever user runs `aged serve`).
-9. **Securely delete the transient scratch copy from the client** — the copied-down old identity and pre-migration ciphertext have served their purpose and should not linger.
-10. **Start `aged serve`.** Confirm the stale-identity warning fires only if you still have `identity`/`AGED_IDENTITY` configured for the server — remove that setting either way, since it's unused now.
-11. **Verify** a real `aged get` works from the client machine using the new identity, against the live server — **before** destroying anything irreversible below. If this fails, you can still recover: the server-side backup from step 7 and the (not yet destroyed) old identity are both still in place.
-12. **Only once verified**, destroy the old server-held identity file — unconditionally, even if you never explicitly configured `identity`. If you always relied on the default path (`~/.config/aged/identity.age` on the server host), that file is the old private key and the stale-identity warning will *not* fire for it (by design — see Configuration above). Move it, rename it, or delete it, and confirm it's gone. **This is the point of no return** — the server-side `secrets.old-<timestamp>/` backup from step 7 becomes permanently undecryptable the moment this identity is gone, so do not reach this step until step 11 has actually succeeded.
-13. **Distribute the client's new identity file to every *other* client machine** that runs `get`/`set` (it already lives on the one that generated it in step 3). This file is now strictly more sensitive than the bearer token — its compromise is total and irreversible short of running `rotate-identity` again:
-    - transfer over an already-authenticated, confidentiality-and-integrity-protected channel (e.g. an existing SSH session to a known-host-verified machine) — not a channel whose only property is "the same one used for the token";
-    - verify file mode `0600` and correct ownership *on arrival* at each destination;
-    - never use a channel that leaves a durable unencrypted copy — chat tools, tickets, email, shared drives, or pasted terminal scrollback are all unsuitable;
-    - back up the identity file with at least the rigour you apply to the `rotate-token` runbook — losing it means losing every secret.
-14. **Only then** delete the server-side `secrets.old-<timestamp>/` backup from step 7 (the old identity should already be gone from step 12).
+# revoke
+aged trust remove age1…B
+aged trust remove age1…C --secret ha-token
 
-**Rollback** (only possible before step 12 — destroying the old identity is what closes this window, since `secrets.old-<timestamp>/` becomes permanently undecryptable the moment it's gone, regardless of whether you've also deleted the directory yet): stop the service, move `secrets.old-<timestamp>` back into place as `secrets_dir`, restore the previous binary and the old `identity` config setting, restart.
+aged trust list [--secret ha-token]   # show the default set and per-secret changes
+aged trust sync                       # re-encrypt every secret to the manifest (repairs a partial run)
+```
+
+- The recipients of a secret are the default set, plus its per-secret `add` keys, minus its per-secret `remove` keys. A per-secret change keeps following later changes to the default set. `aged set` uses this set (and always includes your own key).
+- Trust commands run against the live server. They re-encrypt only affected secrets, write the manifest last, and are safe to rerun; `--dry-run` previews. Secrets your device cannot decrypt are skipped and reported, and the manifest is not advanced unless you pass `--allow-skipped`.
+- `trust remove` stops future access but **cannot take back ciphertext the removed key already copied**; rotate the secret values if that matters. It rotates the manifest's signing key (the removed device may have seen the old one) and then runs a full `sync`, so every secret ends up on the new set even if another device wrote one meanwhile. Removing your own or the last key needs `--force`, and then the sync is left to another trusted device. Every other device confirms the new signing key once (interactively, or `AGED_TRUST_REPIN=1`; `AGED_TRUST_YES=1` deliberately does not cover it; do not export `AGED_TRUST_REPIN` permanently, it disables this check).
+- **Trusting a new device:** run `aged init` there, `aged trust add <its pubkey>` from a trusted device, then use it. A device not in the default set can read secrets re-encrypted to it but cannot run `trust` or `set` until it is added.
+- **First use per server:** each device shows the default recipients and the manifest's signing-key fingerprint and asks once for confirmation (`--yes` or `AGED_TRUST_YES=1` to skip). The signing key is then pinned in `trust-pins.json` beside the identity file, and a manifest with a different key or a lower counter is rejected, so the server or a token holder cannot silently add a recipient. Verify the fingerprint against one you trust (e.g. shown on an existing device).
+- Limitations: a malicious server can still replace a secret with an older blob stored under the same name; every default-set holder can see the per-secret changes; there is no per-device token.
+- To replace a key: `aged trust add <new>` then `aged trust remove <old>`. Back up every identity file with at least the care you give the bearer token; losing all trusted identities means losing every secret.
 
 ## chezmoi integration
 

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,7 +26,7 @@ var nameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+(/[a-zA-Z0-9._-]+)*$`)
 // This is the single authoritative gate called by all HTTP handlers, and by
 // the CLI client before constructing a name-binding envelope.
 func validName(name string) bool {
-	if !nameRe.MatchString(name) {
+	if !nameRe.MatchString(name) || isReservedName(name) {
 		return false
 	}
 	for _, seg := range strings.Split(name, "/") {
@@ -68,6 +69,10 @@ type Store struct {
 	// undetected; canonicalDir is the security boundary each per-operation
 	// check below re-verifies the resolved, symlink-free target against.
 	canonicalDir string
+
+	// mu serialises every write that carries a precondition (manifest
+	// replacement and guarded secret uploads) with its check.
+	mu sync.Mutex
 }
 
 func newStore(secretsDir string) (*Store, error) {
@@ -170,6 +175,12 @@ func (s *Store) setValue(name string, data []byte) error {
 	if err != nil {
 		return err
 	}
+	return s.writeWithinRoot(path, data)
+}
+
+// writeWithinRoot atomically writes data to path after re-verifying that
+// the symlink-resolved parent directory lies within the store root.
+func (s *Store) writeWithinRoot(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create namespace dir: %w", err)
 	}
@@ -303,8 +314,16 @@ func serve() error {
 
 	warnIfIdentityConfigured(cfg, os.Stderr)
 
-	addr := cfg.Addr
-	auth := bearerMiddleware(tenants, os.Stderr)
+	mux := newMux(tenants, os.Stderr)
+
+	log.Printf("aged listening on %s", cfg.Addr)
+	return newHTTPServer(cfg.Addr, mux).ListenAndServe()
+}
+
+// newMux wires every HTTP route for the given tenants. serve() and the tests
+// share it so the routes under test are the routes in production.
+func newMux(tenants []tenant, logDst io.Writer) *http.ServeMux {
+	auth := bearerMiddleware(tenants, logDst)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /secrets", auth(func(w http.ResponseWriter, _ *http.Request, t *tenant) {
@@ -339,6 +358,7 @@ func serve() error {
 			log.Println("get error:", err)
 			return
 		}
+		w.Header().Set("ETag", blobVersion(value))
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(value)
 	}))
@@ -360,7 +380,11 @@ func serve() error {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
-		if err := t.store.setValue(name, body); err != nil {
+		if err := t.store.setValueGuarded(name, body, r.Header.Get(trustHeader), r.Header.Get("If-Match")); err != nil {
+			if status := preconditionStatus(err); status != 0 {
+				http.Error(w, http.StatusText(status), status)
+				return
+			}
 			if errors.Is(err, errInvalidFormat) {
 				http.Error(w, "invalid secret format", http.StatusBadRequest)
 				return
@@ -389,9 +413,9 @@ func serve() error {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
-
-	log.Printf("aged listening on %s", addr)
-	return newHTTPServer(addr, mux).ListenAndServe()
+	mux.HandleFunc("GET /trust", auth(handleTrustGet))
+	mux.HandleFunc("PUT /trust", auth(handleTrustPut))
+	return mux
 }
 
 // warnIfIdentityConfigured logs a one-line warning if the server was started
@@ -406,8 +430,7 @@ func warnIfIdentityConfigured(cfg Config, dst io.Writer) {
 		return
 	}
 	fmt.Fprintf(dst, "warning: identity/AGED_IDENTITY (%s) is configured but no longer used by aged serve — "+
-		"encryption now happens client-side. Secure or remove this file once migration is verified "+
-		"(see: aged rotate-identity).\n", cfg.Identity)
+		"encryption now happens client-side. Secure or remove this file once migration is verified.\n", cfg.Identity)
 }
 
 // sanitiseLogField replaces CR, LF, and all other ASCII control characters
@@ -494,9 +517,7 @@ type tenantHandler func(http.ResponseWriter, *http.Request, *tenant)
 // exists solely so tests can prove the loop performs no early exit — every
 // configured tenant is compared exactly once per request, regardless of
 // where (or whether) a match occurs — without resorting to a flaky
-// wall-clock timing measurement. Always nil in production (see the
-// analogous rotateIdentityCorruptStagedFileHook in rotate_identity.go for
-// the same pattern).
+// wall-clock timing measurement. Always nil in production.
 var bearerMiddlewareCompareHook func()
 
 func bearerMiddleware(tenants []tenant, logDst io.Writer) func(tenantHandler) http.HandlerFunc {

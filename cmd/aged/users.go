@@ -18,7 +18,7 @@ var userNameRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 // validUserName reports whether name is a valid tenant/username: 1-63 bytes,
 // matching [a-zA-Z0-9._-], not "." or "..", and not starting with "-" (a
 // leading dash is a footgun once the name is passed to a shell or to
-// `aged rotate-identity --user <name>`).
+// `aged rotate-token <name>`).
 func validUserName(name string) bool {
 	if len(name) == 0 || len(name) > 63 {
 		return false

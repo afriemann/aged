@@ -6,7 +6,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,77 +36,12 @@ func testServer(t *testing.T) (*httptest.Server, *Store) {
 	return newTestServer(t, singleTenant("testuser", testToken, store)), store
 }
 
-// newTestServer builds an httptest.Server multiplexing the given tenants,
-// exactly as serve() wires the real mux. Used directly by tests that need
-// more than one tenant.
+// newTestServer builds an httptest.Server multiplexing the given tenants
+// with the production routes (newMux). Used directly by tests that need more
+// than one tenant.
 func newTestServer(t *testing.T, tenants []tenant) *httptest.Server {
 	t.Helper()
-	auth := bearerMiddleware(tenants, io.Discard)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /secrets", auth(func(w http.ResponseWriter, _ *http.Request, tn *tenant) {
-		names, _ := tn.store.listNames()
-		if names == nil {
-			names = []string{}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(names)
-	}))
-	mux.HandleFunc("GET /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request, tn *tenant) {
-		name := r.PathValue("name")
-		if !validName(name) {
-			http.Error(w, "invalid name", http.StatusBadRequest)
-			return
-		}
-		val, err := tn.store.getValue(name)
-		if err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(val)
-	}))
-	mux.HandleFunc("POST /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request, tn *tenant) {
-		name := r.PathValue("name")
-		if !validName(name) {
-			http.Error(w, "invalid name", http.StatusBadRequest)
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				http.Error(w, "too large", http.StatusRequestEntityTooLarge)
-				return
-			}
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		if err := tn.store.setValue(name, body); err != nil {
-			if errors.Is(err, errInvalidFormat) {
-				http.Error(w, "invalid secret format", http.StatusBadRequest)
-				return
-			}
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	mux.HandleFunc("DELETE /secrets/{name...}", auth(func(w http.ResponseWriter, r *http.Request, tn *tenant) {
-		name := r.PathValue("name")
-		if !validName(name) {
-			http.Error(w, "invalid name", http.StatusBadRequest)
-			return
-		}
-		if err := tn.store.removeValue(name); err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
-			return
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewServer(newMux(tenants, io.Discard))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -677,45 +611,6 @@ func TestCheckServeConfig_BareTokenAloneIsNoLongerAServerCredential(t *testing.T
 	err := checkServeConfig(Config{Token: "some-token"})
 	if err == nil {
 		t.Fatal("expected an error: Config.Token alone must not define a server user")
-	}
-}
-
-func TestParseRotateIdentityArgs(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		args         []string
-		wantFile     string
-		wantDryRun   bool
-		wantUsername string
-		wantErr      bool
-	}{
-		{"flag before path", []string{"--dry-run", "file.age"}, "file.age", true, "", false},
-		{"flag after path", []string{"file.age", "--dry-run"}, "file.age", true, "", false},
-		{"no flag", []string{"file.age"}, "file.age", false, "", false},
-		{"multiple positional args: last wins", []string{"a.age", "b.age"}, "b.age", false, "", false},
-		{"no args", []string{}, "", false, "", false},
-		{"--user before path", []string{"--user", "alice", "file.age"}, "file.age", false, "alice", false},
-		{"--user after path", []string{"file.age", "--user", "alice"}, "file.age", false, "alice", false},
-		{"--user combined with --dry-run", []string{"--dry-run", "--user", "alice", "file.age"}, "file.age", true, "alice", false},
-		{"--user with no following value", []string{"file.age", "--user"}, "", false, "", true},
-		{"--user immediately followed by another flag", []string{"file.age", "--user", "--dry-run"}, "", false, "", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			gotFile, gotDryRun, gotUsername, err := parseRotateIdentityArgs(tc.args)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("parseRotateIdentityArgs(%v): expected an error, got nil", tc.args)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("parseRotateIdentityArgs(%v): unexpected error: %v", tc.args, err)
-			}
-			if gotFile != tc.wantFile || gotDryRun != tc.wantDryRun || gotUsername != tc.wantUsername {
-				t.Errorf("parseRotateIdentityArgs(%v) = (%q, %v, %q), want (%q, %v, %q)",
-					tc.args, gotFile, gotDryRun, gotUsername, tc.wantFile, tc.wantDryRun, tc.wantUsername)
-			}
-		})
 	}
 }
 

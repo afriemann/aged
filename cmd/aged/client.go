@@ -21,33 +21,51 @@ func serverURL() string {
 	return "http://localhost:8743"
 }
 
-// requestBytes performs an authenticated HTTP request and returns the raw
-// response body, the status code, and any transport error. Unlike request,
-// it applies no trimming — callers handling binary ciphertext must use this,
-// not request, to avoid corrupting a body whose last byte happens to be '\n'.
-func requestBytes(method, path string, body io.Reader) ([]byte, int, error) {
+// apiResponse is the full result of an authenticated API call.
+type apiResponse struct {
+	Body   []byte
+	Status int
+	Header http.Header
+}
+
+// doRequest performs an authenticated HTTP request with optional extra
+// headers. It applies no trimming: callers handling binary ciphertext must
+// not alter the body, since its last byte may legitimately be '\n'.
+func doRequest(method, path string, body io.Reader, headers map[string]string) (*apiResponse, error) {
 	cfg := loadConfig()
 	if cfg.Token == "" {
-		return nil, 0, errors.New("AGED_TOKEN environment variable (or config file token) is required")
+		return nil, errors.New("AGED_TOKEN environment variable (or config file token) is required")
 	}
 
 	req, err := http.NewRequest(method, serverURL()+path, body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/octet-stream")
 	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
-	return data, resp.StatusCode, err
+	return &apiResponse{Body: data, Status: resp.StatusCode, Header: resp.Header}, err
+}
+
+// requestBytes is doRequest without headers, returning only body and status.
+func requestBytes(method, path string, body io.Reader) ([]byte, int, error) {
+	resp, err := doRequest(method, path, body, nil)
+	if resp == nil {
+		return nil, 0, err
+	}
+	return resp.Body, resp.Status, err
 }
 
 // request performs an authenticated HTTP request and returns the trimmed
@@ -75,6 +93,9 @@ func loadClientIdentities() ([]age.Identity, error) {
 // it suitable as a chezmoi secret backend command. The server never
 // performs or assists with decryption.
 func get(name string) error {
+	if !validName(name) {
+		return fmt.Errorf("invalid secret name: %q", name)
+	}
 	identities, err := loadClientIdentities()
 	if err != nil {
 		return err
@@ -159,51 +180,55 @@ func resolveSetValue(argValue string, hasArg bool, hasPipedStdin bool, stdin io.
 	return value, nil
 }
 
-// set encrypts value locally to the caller's own identity — wrapped in a
+// set encrypts value locally to the secret's effective recipients (the trust
+// manifest's default set adjusted by the secret's overrides, plus the local
+// key; the local key alone when no manifest exists) — wrapped in a
 // name-binding envelope — and uploads only the resulting ciphertext. The
-// server never sees the plaintext value. The caller (main, via
-// resolveSetValue) is responsible for resolving value from an explicit
-// argument or from stdin.
+// upload names the manifest version the recipients came from; the server
+// refuses it if the manifest has moved on, in which case set re-reads and
+// retries. The caller (main, via resolveSetValue) resolves value from an
+// explicit argument or from stdin.
 func set(name string, value []byte) error {
 	if !validName(name) {
 		return fmt.Errorf("invalid secret name: %q", name)
 	}
-
 	identities, err := loadClientIdentities()
 	if err != nil {
 		return err
 	}
-	// set encrypts to the caller's own identity, so exactly one identity is
-	// required; the first is used, matching the single-identity default case.
-	// (Multiple identities in the file are meaningful for get's rotation
-	// overlap, not for choosing an encryption target here.)
-	x25519, ok := identities[0].(*age.X25519Identity)
-	if !ok {
-		return fmt.Errorf("identity file does not contain an X25519 identity")
-	}
-
-	envelope := packEnvelope(name, value)
-
-	var buf bytes.Buffer
-	w, err := age.Encrypt(&buf, x25519.Recipient())
-	if err != nil {
-		return fmt.Errorf("create age writer: %w", err)
-	}
-	if _, err := w.Write(envelope); err != nil {
-		return fmt.Errorf("encrypt secret: %w", err)
-	}
-	if err := w.Close(); err != nil {
-		return fmt.Errorf("encrypt secret: %w", err)
-	}
-
-	body, status, err := requestBytes("POST", "/secrets/"+name, bytes.NewReader(buf.Bytes()))
+	local, err := localRecipients(identities)
 	if err != nil {
 		return err
 	}
-	if status != http.StatusNoContent {
-		return fmt.Errorf("server returned %d: %s", status, strings.TrimRight(string(body), "\n"))
+	envelope := packEnvelope(name, value)
+
+	for range trustRetries {
+		state, err := loadManifest(identities)
+		if err != nil {
+			return err
+		}
+		recipients, version := local, trustNone
+		if state != nil {
+			recipients, version = unionKeys(state.body.effective(name), local), state.version
+		}
+		ciphertext, err := encryptToKeys(recipients, envelope)
+		if err != nil {
+			return err
+		}
+		resp, err := doRequest("POST", "/secrets/"+name, bytes.NewReader(ciphertext), map[string]string{trustHeader: version})
+		if err != nil {
+			return err
+		}
+		switch resp.Status {
+		case http.StatusNoContent:
+			return nil
+		case http.StatusPreconditionFailed:
+			continue
+		default:
+			return fmt.Errorf("server returned %d: %s", resp.Status, strings.TrimRight(string(resp.Body), "\n"))
+		}
 	}
-	return nil
+	return errTrustChurn
 }
 
 // list prints one secret name per line.
@@ -228,6 +253,9 @@ func list() error {
 
 // del removes a secret from the server.
 func del(name string) error {
+	if !validName(name) {
+		return fmt.Errorf("invalid secret name: %q", name)
+	}
 	_, status, err := request("DELETE", "/secrets/"+name, nil)
 	if err != nil {
 		return err
