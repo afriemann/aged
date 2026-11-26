@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 )
 
 const helpText = `aged — age-encrypted secret server and client
@@ -17,9 +16,11 @@ Commands:
   delete <name>               delete a secret
   rotate-token [<username>]   generate a new token and update the config file in place
                                  (username required if more than one [[users]] entry is configured)
-  rotate-identity <file>      re-encrypt every secret from the current identity to a new one
-    [--user <name>]             (required if more than one [[users]] entry is configured)
-    [--dry-run]                 (add --dry-run to preview without writing anything)
+  trust list|add|remove|sync  manage which age keys (your other devices) can read your secrets
+    add <age1-key> [--secret <name>]      grant a key access (to all secrets, or one)
+    remove <age1-key> [--secret <name>]   revoke a key (see README: previously copied ciphertext stays readable)
+    sync                                  re-encrypt every secret to the manifest's recipients
+    [--dry-run] [--yes]                   preview only / confirm a first-seen manifest non-interactively
 
   pubkey                      print your own local identity's age public key (no network call)
 
@@ -68,31 +69,6 @@ func parseSetArgs(args []string) (name string, argValue string, hasArg bool, err
 		hasArg = true
 	}
 	return name, argValue, hasArg, nil
-}
-
-// parseRotateIdentityArgs extracts the required new-identity-file path, the
-// optional --dry-run flag, and the optional --user <name> flag from
-// rotate-identity's arguments, in any order. --user as the final argument
-// with no following value, or immediately followed by another flag, is an
-// error rather than silently treating a missing value or the next flag
-// itself as the username.
-func parseRotateIdentityArgs(args []string) (newIdentityFile string, dryRun bool, username string, err error) {
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch a {
-		case "--dry-run":
-			dryRun = true
-		case "--user":
-			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
-				return "", false, "", fmt.Errorf("--user requires a value")
-			}
-			i++
-			username = args[i]
-		default:
-			newIdentityFile = a
-		}
-	}
-	return newIdentityFile, dryRun, username, nil
 }
 
 func main() {
@@ -149,17 +125,8 @@ func main() {
 			os.Exit(1)
 		}
 		err = rotateToken(os.Stdout, username)
-	case "rotate-identity":
-		newIdentityFile, dryRun, username, parseErr := parseRotateIdentityArgs(os.Args[2:])
-		if parseErr != nil {
-			fmt.Fprintln(os.Stderr, parseErr)
-			os.Exit(1)
-		}
-		if newIdentityFile == "" {
-			fmt.Fprintln(os.Stderr, "usage: aged rotate-identity <new-identity-file> [--user <name>] [--dry-run]")
-			os.Exit(1)
-		}
-		err = rotateIdentity(newIdentityFile, username, dryRun, os.Stdout)
+	case "trust":
+		err = runTrust(os.Args[2:], os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n%s", os.Args[1], helpText)
 		os.Exit(1)

@@ -29,9 +29,8 @@ const maxScanOffendersListed = 20
 // offender: it produces a one-line warning to warnDst and does not block
 // startup. This deliberately tolerates an orphaned former user's directory
 // (see the accepted "removed user's directory is orphaned indefinitely"
-// limitation) and a rotate-identity backup/staging sibling, both of which
-// are expected to accumulate inside secrets_dir over the life of a
-// deployment.
+// limitation), which is expected to accumulate inside secrets_dir over the
+// life of a deployment.
 //
 // An absent secretsDir is not an error: it is the normal shape of a fresh
 // install, before any user's directory has been created.
